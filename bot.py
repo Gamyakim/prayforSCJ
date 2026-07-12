@@ -15,7 +15,13 @@ import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -242,6 +248,12 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("신청시작"), KeyboardButton("내 신청 확인")]],
+    resize_keyboard=True,
+)
+
+
 def hour_keyboard(prefix: str):
     """1시~7시(19시) 선택 키보드. prefix로 신청용/관리자용 콜백 구분."""
     buttons = []
@@ -279,7 +291,10 @@ def slot_keyboard_for_hour(hour: int):
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🙏 기도회 신청 봇입니다.\n\n"
+        "🙏 기도회 신청 봇입니다.\n\n아래 메뉴 버튼을 이용해주세요.",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
+    await update.message.reply_text(
         "오후 1시 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
         "타임당 최대 10명(대표자 기준)까지 신청 가능합니다.\n\n"
         "아래에서 원하시는 시간대를 선택해주세요.",
@@ -442,7 +457,10 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("신청이 취소되었습니다. 다시 하시려면 /start 를 입력해주세요.")
+    await update.message.reply_text(
+        "신청이 취소되었습니다. 다시 하시려면 '신청시작' 버튼을 눌러주세요.",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
     return ConversationHandler.END
 
 
@@ -451,7 +469,9 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     rows = get_signups_for_user(user.id)
 
     if not rows:
-        await update.message.reply_text("신청하신 내역이 없어요.")
+        await update.message.reply_text(
+            "신청하신 내역이 없어요.", reply_markup=MAIN_MENU_KEYBOARD
+        )
         return
 
     for r in rows:
@@ -636,7 +656,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup))
     app.add_handler(CommandHandler("mine", my_signups_command))
-    app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청$"), my_signups_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), my_signups_command))
     app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
     app.add_handler(
         CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$")
