@@ -36,9 +36,23 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 # 콤마로 구분된 관리자 텔레그램 숫자 ID (예: "111111111,222222222")
-ADMIN_IDS = {
-    int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x
-}
+def _parse_admin_ids(raw: str):
+    ids = set()
+    for x in raw.replace(" ", "").split(","):
+        if not x:
+            continue
+        if x.isdigit() or (x.startswith("-") and x[1:].isdigit()):
+            ids.add(int(x))
+        else:
+            logger.warning(
+                "ADMIN_IDS 값 중 '%s'는 숫자 ID가 아니라서 무시했어요. "
+                "@userinfobot 에게 물어보면 나오는 숫자 ID를 넣어주세요.",
+                x,
+            )
+    return ids
+
+
+ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
 DB_PATH = os.environ.get("DB_PATH", "prayer_signup.db")
 
