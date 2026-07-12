@@ -152,6 +152,35 @@ def insert_signup(slot_time, rep_name, phone, companions, user_id, username):
         conn.close()
 
 
+def get_signups_for_user(user_id: int):
+    conn = get_conn()
+    cur = conn.execute(
+        "SELECT * FROM signups WHERE telegram_user_id = ? ORDER BY slot_time",
+        (user_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_signup_by_owner(signup_id: int, requester_user_id: int) -> str:
+    """본인 확인 후 삭제. 결과를 ('ok'|'not_owner'|'not_found') 형태로 반환."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM signups WHERE id = ?", (signup_id,)
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        if row["telegram_user_id"] != requester_user_id:
+            return "not_owner"
+        conn.execute("DELETE FROM signups WHERE id = ?", (signup_id,))
+        conn.commit()
+        return "ok"
+    finally:
+        conn.close()
+
+
 def mark_checked_in(signup_id: int, requester_user_id: int):
     """참여완료 체크. 결과를 ('ok'|'already'|'not_owner'|'not_found') 형태로 반환."""
     conn = get_conn()
@@ -417,6 +446,50 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    rows = get_signups_for_user(user.id)
+
+    if not rows:
+        await update.message.reply_text("신청하신 내역이 없어요.")
+        return
+
+    for r in rows:
+        status = "✅ 참여완료" if r["checked_in"] else "⏳ 참여 전"
+        text = (
+            f"⏰ {r['slot_time']}\n"
+            f"👤 대표자: {r['rep_name']}\n"
+            f"📞 연락처: {r['phone']}\n"
+            f"👥 동반자: {r['companions']}\n"
+            f"상태: {status}"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("❌ 이 신청 취소", callback_data=f"usercancel_{r['id']}")]]
+        )
+        await update.message.reply_text(text, reply_markup=keyboard)
+
+
+async def user_cancel_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    signup_id = int(query.data.split("_", 1)[1])
+    result = delete_signup_by_owner(signup_id, query.from_user.id)
+
+    if result == "not_found":
+        await query.answer("이미 취소되었거나 존재하지 않는 신청이에요.", show_alert=True)
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+    if result == "not_owner":
+        await query.answer("본인 신청 건만 취소할 수 있어요.", show_alert=True)
+        return
+
+    await query.answer("신청이 취소되었어요.")
+    original_text = query.message.text or ""
+    await query.edit_message_text(
+        original_text + "\n\n❌ 취소된 신청입니다.",
+        reply_markup=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 관리자 핸들러
 # ---------------------------------------------------------------------------
@@ -562,6 +635,9 @@ def main():
     # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"을 보내면 반응하게 처리
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup))
+    app.add_handler(CommandHandler("mine", my_signups_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청$"), my_signups_command))
+    app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
     app.add_handler(
         CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$")
     )
