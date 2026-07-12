@@ -175,6 +175,17 @@ def mark_checked_in(signup_id: int, requester_user_id: int):
         conn.close()
 
 
+def delete_signup(signup_id: int) -> bool:
+    """신청 건 삭제. 삭제됐으면 True, 존재하지 않으면 False."""
+    conn = get_conn()
+    try:
+        cur = conn.execute("DELETE FROM signups WHERE id = ?", (signup_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def get_signups_for_hour(hour: int):
     conn = get_conn()
     prefix = f"{hour:02d}:"
@@ -445,8 +456,9 @@ async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
             for e in entries:
                 status = "✅" if e["checked_in"] else "⏳"
                 lines.append(
-                    f"  {status} {e['rep_name']} / {e['phone']} / 동반자: {e['companions']}"
+                    f"  {status} [{e['id']}] {e['rep_name']} / {e['phone']} / 동반자: {e['companions']}"
                 )
+        lines.append("\n삭제하려면 '삭제 (번호)' 형식으로 입력해주세요. 예: 삭제 3")
         text = "\n".join(lines)
 
     keyboard = InlineKeyboardMarkup(
@@ -464,6 +476,21 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "확인하실 시간대를 선택해주세요.", reply_markup=hour_keyboard(prefix="admin_")
     )
+
+
+async def admin_delete_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return  # 관리자가 아니면 조용히 무시 (일반 사용자 텍스트와 우연히 겹치는 것 방지)
+
+    match = re.match(r"^삭제\s+(\d+)$", update.message.text.strip())
+    if not match:
+        return
+    signup_id = int(match.group(1))
+    deleted = delete_signup(signup_id)
+    if deleted:
+        await update.message.reply_text(f"🗑 [{signup_id}]번 신청을 삭제했습니다.")
+    else:
+        await update.message.reply_text(f"[{signup_id}]번 신청을 찾을 수 없어요.")
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +554,7 @@ def main():
     app.add_handler(CommandHandler("admin", admin_command))
     # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"을 보내면 반응하게 처리
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup))
     app.add_handler(
         CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$")
     )
