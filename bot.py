@@ -110,6 +110,35 @@ def init_db():
             conn.execute(col_sql)
         except sqlite3.OperationalError:
             pass  # 이미 컬럼이 존재하는 경우
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+DEFAULT_EVENT_TITLE = "릴레이 기도회"
+
+
+def get_setting(key: str, default: str) -> str:
+    conn = get_conn()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
     conn.commit()
     conn.close()
 
@@ -290,8 +319,9 @@ def slot_keyboard_for_hour(hour: int):
 # 신청 흐름 핸들러
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    title = get_setting("event_title", DEFAULT_EVENT_TITLE)
     await update.message.reply_text(
-        "🙏 기도회 신청 봇입니다.\n\n아래 메뉴 버튼을 이용해주세요.",
+        f"🙏{title} 신청 봇입니다.\n\n아래 메뉴 버튼을 이용해주세요.",
         reply_markup=MAIN_MENU_KEYBOARD,
     )
     await update.message.reply_text(
@@ -465,6 +495,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     user = update.effective_user
     rows = get_signups_for_user(user.id)
 
@@ -472,7 +503,7 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(
             "신청하신 내역이 없어요.", reply_markup=MAIN_MENU_KEYBOARD
         )
-        return
+        return ConversationHandler.END
 
     for r in rows:
         status = "✅ 참여완료" if r["checked_in"] else "⏳ 참여 전"
@@ -487,6 +518,7 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [[InlineKeyboardButton("❌ 이 신청 취소", callback_data=f"usercancel_{r['id']}")]]
         )
         await update.message.reply_text(text, reply_markup=keyboard)
+    return ConversationHandler.END
 
 
 async def user_cancel_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -516,10 +548,12 @@ async def user_cancel_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("관리자만 사용할 수 있어요.")
-        return
+        return ConversationHandler.END
+    context.user_data.clear()
     await update.message.reply_text(
         "확인하실 시간대를 선택해주세요.", reply_markup=hour_keyboard(prefix="admin_")
     )
+    return ConversationHandler.END
 
 
 async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,17 +607,35 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_delete_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        return  # 관리자가 아니면 조용히 무시 (일반 사용자 텍스트와 우연히 겹치는 것 방지)
+        return None  # 관리자가 아니면 조용히 무시 (일반 사용자 텍스트와 우연히 겹치는 것 방지)
 
     match = re.match(r"^삭제\s+(\d+)$", update.message.text.strip())
     if not match:
-        return
+        return None
+    context.user_data.clear()
     signup_id = int(match.group(1))
     deleted = delete_signup(signup_id)
     if deleted:
         await update.message.reply_text(f"🗑 [{signup_id}]번 신청을 삭제했습니다.")
     else:
         await update.message.reply_text(f"[{signup_id}]번 신청을 찾을 수 없어요.")
+    return ConversationHandler.END
+
+
+async def admin_set_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+
+    match = re.match(r"^제목설정\s+(.+)$", update.message.text.strip())
+    if not match:
+        return None
+    context.user_data.clear()
+    title = match.group(1).strip()
+    set_setting("event_title", title)
+    await update.message.reply_text(
+        f"✅ 제목이 변경되었습니다.\n\n미리보기:\n🙏{title} 신청 봇입니다."
+    )
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -646,15 +698,24 @@ def main():
         fallbacks=[
             CommandHandler("cancel", cancel_command),
             MessageHandler(filters.Regex(r"^취소$"), cancel_command),
+            CommandHandler("mine", my_signups_command),
+            MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), my_signups_command),
+            CommandHandler("admin", admin_command),
+            MessageHandler(filters.Regex(r"^명단$"), admin_command),
+            MessageHandler(filters.Regex(r"^관리자$"), admin_command),
+            MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup),
+            MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title),
         ],
         allow_reentry=True,
     )
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("admin", admin_command))
-    # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"을 보내면 반응하게 처리
+    # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"/"관리자"를 보내면 반응하게 처리
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup))
+    app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title))
     app.add_handler(CommandHandler("mine", my_signups_command))
     app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), my_signups_command))
     app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
