@@ -432,8 +432,9 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("명단", admin_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"을 보내면 반응하게 처리
+    app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
     app.add_handler(
         CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$")
     )
