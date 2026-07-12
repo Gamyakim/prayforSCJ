@@ -4,16 +4,20 @@
 - 오후 1시~8시, 10분 단위 타임슬롯 (총 42개)
 - 슬롯당 최대 10명(대표자 기준)
 - 대표자 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자 입력
-- 관리자는 버튼으로 타임별 명단 조회
+- 참여완료 체크 (본인만)
+- 관리자는 버튼/텍스트로 타임별 명단 조회, 삭제, 제목 설정
+- 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
 """
 
 import os
 import re
-import sqlite3
 import logging
 import threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import psycopg2
+import psycopg2.extras
 
 from telegram import (
     InlineKeyboardButton,
@@ -22,7 +26,6 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -43,7 +46,8 @@ logger = logging.getLogger(__name__)
 # 환경설정
 # ---------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-# 콤마로 구분된 관리자 텔레그램 숫자 ID (예: "111111111,222222222")
+
+
 def _parse_admin_ids(raw: str):
     ids = set()
     for x in raw.replace(" ", "").split(","):
@@ -62,7 +66,7 @@ def _parse_admin_ids(raw: str):
 
 ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
-DB_PATH = os.environ.get("DB_PATH", "prayer_signup.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 MAX_PER_SLOT = 10
 HOURS = list(range(13, 20))  # 13시 ~ 19시 (각 시간당 6개 슬롯, 마지막 슬롯 19:50)
@@ -73,103 +77,162 @@ PHONE_PATTERN = re.compile(r"^01[016789]-\d{3,4}-\d{4}$")
 # 대화 상태
 SELECT_SLOT, ENTER_NAME, ENTER_PHONE, ENTER_COMPANIONS, CONFIRM = range(5)
 
+DEFAULT_EVENT_TITLE = "릴레이 기도회"
+
 
 # ---------------------------------------------------------------------------
-# DB
+# DB (PostgreSQL)
 # ---------------------------------------------------------------------------
+def get_db_admin_ids():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM admins")
+        return {row["user_id"] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def add_db_admin(user_id: int, added_by: int) -> bool:
+    """추가 성공(신규)이면 True, 이미 있었으면 False."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM admins WHERE user_id = %s", (user_id,))
+        if cur.fetchone():
+            return False
+        cur.execute(
+            "INSERT INTO admins (user_id, added_by, added_at) VALUES (%s, %s, %s)",
+            (user_id, added_by, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def remove_db_admin(user_id: int) -> bool:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL 환경변수가 설정되지 않았습니다.")
+    url = DATABASE_URL
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db():
     conn = get_conn()
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS signups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            slot_time TEXT NOT NULL,
-            rep_name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            companions TEXT,
-            telegram_user_id INTEGER,
-            telegram_username TEXT,
-            created_at TEXT NOT NULL,
-            checked_in INTEGER NOT NULL DEFAULT 0,
-            checked_in_at TEXT
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signups (
+                id SERIAL PRIMARY KEY,
+                slot_time TEXT NOT NULL,
+                rep_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                companions TEXT,
+                telegram_user_id BIGINT,
+                telegram_username TEXT,
+                created_at TEXT NOT NULL,
+                checked_in INTEGER NOT NULL DEFAULT 0,
+                checked_in_at TEXT
+            )
+            """
         )
-        """
-    )
-    # 기존에 이미 배포된 DB에는 컬럼이 없을 수 있어 안전하게 추가 시도
-    for col_sql in (
-        "ALTER TABLE signups ADD COLUMN checked_in INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE signups ADD COLUMN checked_in_at TEXT",
-    ):
-        try:
-            conn.execute(col_sql)
-        except sqlite3.OperationalError:
-            pass  # 이미 컬럼이 존재하는 경우
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
         )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-DEFAULT_EVENT_TITLE = "릴레이 기도회"
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                added_by BIGINT,
+                added_at TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_setting(key: str, default: str) -> str:
     conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    conn.close()
-    return row["value"] if row else default
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
 
 
 def set_setting(key: str, value: str):
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def count_slot(slot_time: str) -> int:
     conn = get_conn()
-    cur = conn.execute(
-        "SELECT COUNT(*) as cnt FROM signups WHERE slot_time = ?", (slot_time,)
-    )
-    cnt = cur.fetchone()["cnt"]
-    conn.close()
-    return cnt
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
+        )
+        return cur.fetchone()["cnt"]
+    finally:
+        conn.close()
 
 
 def insert_signup(slot_time, rep_name, phone, companions, user_id, username):
-    """정원 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환."""
+    """정원 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
+    테이블 락으로 동시 신청 시에도 정원이 초과되지 않도록 보장."""
     conn = get_conn()
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
-            "SELECT COUNT(*) as cnt FROM signups WHERE slot_time = ?", (slot_time,)
+        cur = conn.cursor()
+        cur.execute("LOCK TABLE signups IN SHARE ROW EXCLUSIVE MODE")
+        cur.execute(
+            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
         )
         cnt = cur.fetchone()["cnt"]
         if cnt >= MAX_PER_SLOT:
             conn.rollback()
             return None
-        cur = conn.execute(
+        cur.execute(
             """
             INSERT INTO signups
                 (slot_time, rep_name, phone, companions, telegram_user_id, telegram_username, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
             """,
             (
                 slot_time,
@@ -181,37 +244,9 @@ def insert_signup(slot_time, rep_name, phone, companions, user_id, username):
                 datetime.now().isoformat(timespec="seconds"),
             ),
         )
+        new_id = cur.fetchone()["id"]
         conn.commit()
-        return cur.lastrowid
-    finally:
-        conn.close()
-
-
-def get_signups_for_user(user_id: int):
-    conn = get_conn()
-    cur = conn.execute(
-        "SELECT * FROM signups WHERE telegram_user_id = ? ORDER BY slot_time",
-        (user_id,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def delete_signup_by_owner(signup_id: int, requester_user_id: int) -> str:
-    """본인 확인 후 삭제. 결과를 ('ok'|'not_owner'|'not_found') 형태로 반환."""
-    conn = get_conn()
-    try:
-        row = conn.execute(
-            "SELECT * FROM signups WHERE id = ?", (signup_id,)
-        ).fetchone()
-        if row is None:
-            return "not_found"
-        if row["telegram_user_id"] != requester_user_id:
-            return "not_owner"
-        conn.execute("DELETE FROM signups WHERE id = ?", (signup_id,))
-        conn.commit()
-        return "ok"
+        return new_id
     finally:
         conn.close()
 
@@ -220,17 +255,17 @@ def mark_checked_in(signup_id: int, requester_user_id: int):
     """참여완료 체크. 결과를 ('ok'|'already'|'not_owner'|'not_found') 형태로 반환."""
     conn = get_conn()
     try:
-        row = conn.execute(
-            "SELECT * FROM signups WHERE id = ?", (signup_id,)
-        ).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signups WHERE id = %s", (signup_id,))
+        row = cur.fetchone()
         if row is None:
             return "not_found"
         if row["telegram_user_id"] != requester_user_id:
             return "not_owner"
         if row["checked_in"]:
             return "already"
-        conn.execute(
-            "UPDATE signups SET checked_in = 1, checked_in_at = ? WHERE id = ?",
+        cur.execute(
+            "UPDATE signups SET checked_in = 1, checked_in_at = %s WHERE id = %s",
             (datetime.now().isoformat(timespec="seconds"), signup_id),
         )
         conn.commit()
@@ -239,42 +274,71 @@ def mark_checked_in(signup_id: int, requester_user_id: int):
         conn.close()
 
 
-def delete_signup(signup_id: int) -> bool:
-    """신청 건 삭제. 삭제됐으면 True, 존재하지 않으면 False."""
+def get_signups_for_hour(hour: int):
     conn = get_conn()
     try:
-        cur = conn.execute("DELETE FROM signups WHERE id = ?", (signup_id,))
-        conn.commit()
-        return cur.rowcount > 0
+        cur = conn.cursor()
+        prefix = f"{hour:02d}:"
+        cur.execute(
+            "SELECT * FROM signups WHERE slot_time LIKE %s ORDER BY slot_time, id",
+            (f"{prefix}%",),
+        )
+        return cur.fetchall()
     finally:
         conn.close()
 
 
-def get_signups_for_hour(hour: int):
+def get_signups_for_user(user_id: int):
     conn = get_conn()
-    prefix = f"{hour:02d}:"
-    cur = conn.execute(
-        "SELECT * FROM signups WHERE slot_time LIKE ? ORDER BY slot_time, id",
-        (f"{prefix}%",),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT * FROM signups WHERE telegram_user_id = %s ORDER BY slot_time",
+            (user_id,),
+        )
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def delete_signup(signup_id: int) -> bool:
+    """신청 건 삭제. 삭제됐으면 True, 존재하지 않으면 False."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM signups WHERE id = %s", (signup_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
+
+
+def delete_signup_by_owner(signup_id: int, requester_user_id: int) -> str:
+    """본인 확인 후 삭제. 결과를 ('ok'|'not_owner'|'not_found') 형태로 반환."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signups WHERE id = %s", (signup_id,))
+        row = cur.fetchone()
+        if row is None:
+            return "not_found"
+        if row["telegram_user_id"] != requester_user_id:
+            return "not_owner"
+        cur.execute("DELETE FROM signups WHERE id = %s", (signup_id,))
+        conn.commit()
+        return "ok"
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
 # 유틸
 # ---------------------------------------------------------------------------
-def all_slots():
-    slots = []
-    for h in HOURS:
-        for m in MINUTES:
-            slots.append(f"{h:02d}:{m:02d}")
-    return slots
-
-
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    if user_id in ADMIN_IDS:
+        return True
+    return user_id in get_db_admin_ids()
 
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
@@ -433,11 +497,18 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     companions = context.user_data.get("companions")
     user = query.from_user
 
+    logger.info(
+        "[제출 시도] user_id=%s username=%s slot=%s name=%s",
+        user.id, user.username, slot, name,
+    )
+
     signup_id = insert_signup(slot, name, phone, companions, user.id, user.username or "")
+
+    logger.info("[제출 결과] user_id=%s -> signup_id=%s", user.id, signup_id)
 
     if signup_id is None:
         await query.edit_message_text(
-            "😥 죄송해요, 방금 정원이 다 찼어요.\n/start 로 다른 타임을 선택해주세요."
+            "😥 죄송해요, 방금 정원이 다 찼어요.\n'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
     else:
         checkin_keyboard = InlineKeyboardMarkup(
@@ -457,7 +528,12 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def checkin_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     signup_id = int(query.data.split("_", 1)[1])
+    logger.info(
+        "[참여완료 클릭] signup_id=%s clicker_user_id=%s clicker_username=%s",
+        signup_id, query.from_user.id, query.from_user.username,
+    )
     result = mark_checked_in(signup_id, query.from_user.id)
+    logger.info("[참여완료 결과] signup_id=%s -> %s", signup_id, result)
 
     if result == "not_found":
         await query.answer("신청 정보를 찾을 수 없어요.", show_alert=True)
@@ -480,7 +556,7 @@ async def checkin_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("신청이 취소되었습니다. 다시 하시려면 /start 를 입력해주세요.")
+    await query.edit_message_text("신청이 취소되었습니다. 다시 하시려면 '신청시작' 버튼을 눌러주세요.")
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -638,10 +714,108 @@ async def admin_set_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def admin_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+    match = re.match(r"^관리자추가\s+(\S+)$", update.message.text.strip())
+    if not match:
+        return None
+    context.user_data.clear()
+    arg = match.group(1)
+
+    if arg.isdigit():
+        new_id = int(arg)
+    elif arg.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(arg)
+            new_id = chat.id
+        except Exception:
+            await update.message.reply_text(
+                f"{arg} 님을 찾을 수 없어요. 그 분이 이 봇과 한 번이라도 대화(예: '신청시작')를 "
+                "해본 적이 있어야 아이디로 찾을 수 있어요.\n\n"
+                "안 되면 숫자 ID로 추가해주세요.\n"
+                "(본인 텔레그램 숫자 ID는 @userinfobot 에게 물어보면 알 수 있어요)\n"
+                "예: 관리자추가 123456789"
+            )
+            return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "숫자 ID 또는 @username 형식으로 입력해주세요.\n예: 관리자추가 123456789"
+        )
+        return ConversationHandler.END
+
+    added = add_db_admin(new_id, update.effective_user.id)
+    if added:
+        await update.message.reply_text(f"✅ {arg} ({new_id}) 님을 관리자로 추가했습니다.")
+    else:
+        await update.message.reply_text(f"{arg} ({new_id}) 님은 이미 관리자예요.")
+    return ConversationHandler.END
+
+
+async def admin_remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+    match = re.match(r"^관리자삭제\s+(\S+)$", update.message.text.strip())
+    if not match:
+        return None
+    context.user_data.clear()
+    arg = match.group(1)
+
+    if arg.isdigit():
+        target_id = int(arg)
+    elif arg.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(arg)
+            target_id = chat.id
+        except Exception:
+            await update.message.reply_text(
+                f"{arg} 님을 찾을 수 없어요. 숫자 ID로 다시 시도해주세요.\n예: 관리자삭제 123456789"
+            )
+            return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "숫자 ID 또는 @username 형식으로 입력해주세요.\n예: 관리자삭제 123456789"
+        )
+        return ConversationHandler.END
+
+    if target_id in ADMIN_IDS:
+        await update.message.reply_text(
+            "이 계정은 Render 환경변수(ADMIN_IDS)에 등록된 관리자라 봇에서는 삭제할 수 없어요.\n"
+            "삭제하려면 Render 환경변수에서 직접 지워주세요."
+        )
+        return ConversationHandler.END
+    removed = remove_db_admin(target_id)
+    if removed:
+        await update.message.reply_text(f"🗑 {arg} ({target_id}) 님을 관리자에서 제외했습니다.")
+    else:
+        await update.message.reply_text(f"{arg} ({target_id}) 님은 관리자 목록에 없어요.")
+    return ConversationHandler.END
+
+
+async def admin_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+    context.user_data.clear()
+    env_ids = sorted(ADMIN_IDS)
+    db_ids = sorted(get_db_admin_ids())
+    lines = ["👑 관리자 목록\n"]
+    if env_ids:
+        lines.append("[환경변수 등록 - 봇에서 삭제 불가]")
+        lines.extend(f"  · {uid}" for uid in env_ids)
+    if db_ids:
+        lines.append("\n[봇에서 추가된 관리자]")
+        lines.extend(f"  · {uid}" for uid in db_ids)
+    if not env_ids and not db_ids:
+        lines.append("등록된 관리자가 없어요.")
+    lines.append(
+        "\n추가: '관리자추가 (숫자ID)' / 삭제: '관리자삭제 (숫자ID)'"
+    )
+    await update.message.reply_text("\n".join(lines))
+    return ConversationHandler.END
+
+
 # ---------------------------------------------------------------------------
 # Render Web Service용 헬스체크 서버
-# 텔레그램 봇은 포트를 쓰지 않지만, Render가 Web Service 타입에서
-# 포트 응답 여부로 헬스체크를 하기 때문에 아주 작은 서버를 같이 띄워줌
 # ---------------------------------------------------------------------------
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -705,10 +879,13 @@ def main():
             MessageHandler(filters.Regex(r"^관리자$"), admin_command),
             MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup),
             MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title),
+            MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin),
+            MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), admin_remove_admin),
+            MessageHandler(filters.Regex(r"^관리자목록$"), admin_list_admins),
         ],
         allow_reentry=True,
-    ) 
-    
+    )
+
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("admin", admin_command))
     # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"/"관리자"를 보내면 반응하게 처리
@@ -716,6 +893,9 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup))
     app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title))
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin))
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), admin_remove_admin))
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자목록$"), admin_list_admins))
     app.add_handler(CommandHandler("mine", my_signups_command))
     app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), my_signups_command))
     app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
