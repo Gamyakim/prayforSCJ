@@ -529,7 +529,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex(r"^신청시작$"), start),
+        ],
         states={
             SELECT_SLOT: [
                 CallbackQueryHandler(hour_selected, pattern=r"^req_hour_\d+$"),
@@ -547,7 +550,10 @@ def main():
                 CallbackQueryHandler(cancel_signup, pattern=r"^cancel$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            MessageHandler(filters.Regex(r"^취소$"), cancel_command),
+        ],
         allow_reentry=True,
     )
 
