@@ -707,8 +707,8 @@ def main():
             MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title),
         ],
         allow_reentry=True,
-    )
-
+    ) 
+    
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("admin", admin_command))
     # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"/"관리자"를 보내면 반응하게 처리
