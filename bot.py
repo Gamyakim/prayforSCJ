@@ -87,10 +87,21 @@ def init_db():
             companions TEXT,
             telegram_user_id INTEGER,
             telegram_username TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            checked_in INTEGER NOT NULL DEFAULT 0,
+            checked_in_at TEXT
         )
         """
     )
+    # 기존에 이미 배포된 DB에는 컬럼이 없을 수 있어 안전하게 추가 시도
+    for col_sql in (
+        "ALTER TABLE signups ADD COLUMN checked_in INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE signups ADD COLUMN checked_in_at TEXT",
+    ):
+        try:
+            conn.execute(col_sql)
+        except sqlite3.OperationalError:
+            pass  # 이미 컬럼이 존재하는 경우
     conn.commit()
     conn.close()
 
@@ -105,8 +116,8 @@ def count_slot(slot_time: str) -> int:
     return cnt
 
 
-def insert_signup(slot_time, rep_name, phone, companions, user_id, username) -> bool:
-    """정원 체크 후 삽입. 성공하면 True, 정원 초과면 False."""
+def insert_signup(slot_time, rep_name, phone, companions, user_id, username):
+    """정원 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환."""
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -116,8 +127,8 @@ def insert_signup(slot_time, rep_name, phone, companions, user_id, username) -> 
         cnt = cur.fetchone()["cnt"]
         if cnt >= MAX_PER_SLOT:
             conn.rollback()
-            return False
-        conn.execute(
+            return None
+        cur = conn.execute(
             """
             INSERT INTO signups
                 (slot_time, rep_name, phone, companions, telegram_user_id, telegram_username, created_at)
@@ -134,7 +145,30 @@ def insert_signup(slot_time, rep_name, phone, companions, user_id, username) -> 
             ),
         )
         conn.commit()
-        return True
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def mark_checked_in(signup_id: int, requester_user_id: int):
+    """참여완료 체크. 결과를 ('ok'|'already'|'not_owner'|'not_found') 형태로 반환."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT * FROM signups WHERE id = ?", (signup_id,)
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        if row["telegram_user_id"] != requester_user_id:
+            return "not_owner"
+        if row["checked_in"]:
+            return "already"
+        conn.execute(
+            "UPDATE signups SET checked_in = 1, checked_in_at = ? WHERE id = ?",
+            (datetime.now().isoformat(timespec="seconds"), signup_id),
+        )
+        conn.commit()
+        return "ok"
     finally:
         conn.close()
 
@@ -312,20 +346,48 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     companions = context.user_data.get("companions")
     user = query.from_user
 
-    ok = insert_signup(slot, name, phone, companions, user.id, user.username or "")
+    signup_id = insert_signup(slot, name, phone, companions, user.id, user.username or "")
 
-    if not ok:
+    if signup_id is None:
         await query.edit_message_text(
             "😥 죄송해요, 방금 정원이 다 찼어요.\n/start 로 다른 타임을 선택해주세요."
         )
     else:
+        checkin_keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🙋 참여완료", callback_data=f"checkin_{signup_id}")]]
+        )
         await query.edit_message_text(
             f"✅ 신청 완료되었습니다!\n\n"
             f"⏰ {slot} / 👤 {name} / 👥 {companions}\n\n"
-            "신청해주셔서 감사합니다 🙏"
+            "신청해주셔서 감사합니다 🙏\n\n"
+            "기도회에 실제로 참여하신 후 아래 버튼을 눌러주세요.",
+            reply_markup=checkin_keyboard,
         )
     context.user_data.clear()
     return ConversationHandler.END
+
+
+async def checkin_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    signup_id = int(query.data.split("_", 1)[1])
+    result = mark_checked_in(signup_id, query.from_user.id)
+
+    if result == "not_found":
+        await query.answer("신청 정보를 찾을 수 없어요.", show_alert=True)
+        return
+    if result == "not_owner":
+        await query.answer("본인 신청 건만 체크인할 수 있어요.", show_alert=True)
+        return
+    if result == "already":
+        await query.answer("이미 참여완료 처리되었어요 🙏", show_alert=True)
+        return
+
+    await query.answer("참여 체크 완료! 감사합니다 🙏")
+    original_text = query.message.text or ""
+    await query.edit_message_text(
+        original_text + "\n\n✅ 참여완료 체크되었습니다.",
+        reply_markup=None,
+    )
 
 
 async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,10 +436,14 @@ async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         for m in MINUTES:
             slot = f"{hour:02d}:{m:02d}"
             entries = by_slot.get(slot, [])
-            lines.append(f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}명")
+            checked_cnt = sum(1 for e in entries if e["checked_in"])
+            lines.append(
+                f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}명)"
+            )
             for e in entries:
+                status = "✅" if e["checked_in"] else "⏳"
                 lines.append(
-                    f"  · {e['rep_name']} / {e['phone']} / 동반자: {e['companions']}"
+                    f"  {status} {e['rep_name']} / {e['phone']} / 동반자: {e['companions']}"
                 )
         text = "\n".join(lines)
 
@@ -439,6 +505,7 @@ def main():
         CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$")
     )
     app.add_handler(CallbackQueryHandler(admin_back, pattern=r"^admin_back$"))
+    app.add_handler(CallbackQueryHandler(checkin_clicked, pattern=r"^checkin_\d+$"))
 
     logger.info("봇 시작...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
