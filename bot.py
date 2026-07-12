@@ -548,6 +548,7 @@ def main():
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel_command)],
+        allow_reentry=True,
     )
 
     app.add_handler(conv_handler)
