@@ -11,7 +11,9 @@ import os
 import re
 import sqlite3
 import logging
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -465,6 +467,28 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Render Web Service용 헬스체크 서버
+# 텔레그램 봇은 포트를 쓰지 않지만, Render가 Web Service 타입에서
+# 포트 응답 여부로 헬스체크를 하기 때문에 아주 작은 서버를 같이 띄워줌
+# ---------------------------------------------------------------------------
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # 헬스체크 요청 로그는 생략
+
+
+def _run_health_server():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    logger.info("헬스체크 서버 시작 (port %s)", port)
+    server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
 # 메인
 # ---------------------------------------------------------------------------
 def main():
@@ -472,6 +496,8 @@ def main():
         raise RuntimeError("BOT_TOKEN 환경변수가 설정되지 않았습니다.")
 
     init_db()
+
+    threading.Thread(target=_run_health_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
