@@ -2,7 +2,8 @@
 """
 기도회 신청 텔레그램 봇
 - 오후 1시~8시, 10분 단위 타임슬롯 (총 42개)
-- 슬롯당 최대 10명 (구역장 1명 + 동반자 인원 합산 기준)
+- 슬롯당 최대 10건 신청 가능 (신청 건수 기준)
+- 한 건의 신청 안에서는 구역장 + 동반자 합쳐 10명을 넘을 수 없음
 - 회/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
 - 관리자는 버튼/텍스트로 타임별 명단 조회, 삭제, 제목 설정, 관리자 추가/삭제
@@ -68,7 +69,8 @@ ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-MAX_PER_SLOT = 10  # 10분 슬롯당 최대 인원 (구역장 + 동반자 합산)
+MAX_PER_SLOT = 10       # 10분 슬롯당 최대 신청 "건수"
+MAX_PER_SIGNUP = 10     # 신청 한 건당 최대 인원 (구역장 + 동반자 합산)
 HOURS = list(range(13, 20))  # 13시 ~ 19시 (각 시간당 6개 슬롯, 마지막 슬롯 19:50)
 MINUTES = [0, 10, 20, 30, 40, 50]
 HOUR_CAPACITY = MAX_PER_SLOT * len(MINUTES)
@@ -206,7 +208,7 @@ def set_setting(key: str, value: str):
 
 
 # ---------------------------------------------------------------------------
-# 인원수 계산 유틸 (구역장 1명 + 동반자 콤마 구분 인원)
+# 동반자(콤마 구분) 인원수 계산 유틸 - 한 건당 인원 제한 검증용
 # ---------------------------------------------------------------------------
 def companion_count(companions: str) -> int:
     s = (companions or "").strip()
@@ -219,47 +221,46 @@ def signup_headcount(companions: str) -> int:
     return 1 + companion_count(companions)
 
 
-def get_slot_headcount(slot_time: str) -> int:
+# ---------------------------------------------------------------------------
+# 슬롯 정원 = 신청 "건수" 기준 (10건)
+# ---------------------------------------------------------------------------
+def count_slot(slot_time: str) -> int:
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT companions FROM signups WHERE slot_time = %s", (slot_time,)
+            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
         )
-        rows = cur.fetchall()
-        return sum(signup_headcount(r["companions"]) for r in rows)
+        return cur.fetchone()["cnt"]
     finally:
         conn.close()
 
 
-def get_hour_headcount(hour: int) -> int:
+def count_hour(hour: int) -> int:
     conn = get_conn()
     try:
         cur = conn.cursor()
         prefix = f"{hour:02d}:"
         cur.execute(
-            "SELECT companions FROM signups WHERE slot_time LIKE %s", (f"{prefix}%",)
+            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time LIKE %s", (f"{prefix}%",)
         )
-        rows = cur.fetchall()
-        return sum(signup_headcount(r["companions"]) for r in rows)
+        return cur.fetchone()["cnt"]
     finally:
         conn.close()
 
 
 def insert_signup(slot_time, group_name, rep_name, phone, companions, user_id, username):
-    """정원(인원수 기준) 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
+    """슬롯 정원(신청 건수 10건) 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
     테이블 락으로 동시 신청 시에도 정원이 초과되지 않도록 보장."""
-    new_headcount = signup_headcount(companions)
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("LOCK TABLE signups IN SHARE ROW EXCLUSIVE MODE")
         cur.execute(
-            "SELECT companions FROM signups WHERE slot_time = %s", (slot_time,)
+            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
         )
-        rows = cur.fetchall()
-        current_headcount = sum(signup_headcount(r["companions"]) for r in rows)
-        if current_headcount + new_headcount > MAX_PER_SLOT:
+        cnt = cur.fetchone()["cnt"]
+        if cnt >= MAX_PER_SLOT:
             conn.rollback()
             return None
         cur.execute(
@@ -385,14 +386,14 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 def hour_keyboard(prefix: str):
     """1시~7시(19시) 선택 키보드. prefix로 신청용/관리자용 콜백 구분.
-    신청용(prefix='req_')일 때는 시간대별 잔여 인원을 같이 보여준다."""
+    신청용(prefix='req_')일 때는 시간대별 잔여 신청 건수를 같이 보여준다."""
     show_capacity = prefix == "req_"
     buttons = []
     row = []
     for h in HOURS:
         if show_capacity:
-            filled = get_hour_headcount(h)
-            label = f"{h}시({filled}/{HOUR_CAPACITY}명)"
+            filled = count_hour(h)
+            label = f"{h}시({filled}/{HOUR_CAPACITY}건)"
             if filled >= HOUR_CAPACITY:
                 label += " 마감"
         else:
@@ -411,9 +412,9 @@ def slot_keyboard_for_hour(hour: int):
     row = []
     for m in MINUTES:
         slot = f"{hour:02d}:{m:02d}"
-        filled = get_slot_headcount(slot)
-        label = f"{slot} ({filled}/{MAX_PER_SLOT})" + (" 마감" if filled >= MAX_PER_SLOT else "")
-        cb = "full" if filled >= MAX_PER_SLOT else f"slot_{slot}"
+        cnt = count_slot(slot)
+        label = f"{slot} ({cnt}/{MAX_PER_SLOT})" + (" 마감" if cnt >= MAX_PER_SLOT else "")
+        cb = "full" if cnt >= MAX_PER_SLOT else f"slot_{slot}"
         row.append(InlineKeyboardButton(label, callback_data=cb))
         if len(row) == 2:
             buttons.append(row)
@@ -435,7 +436,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         "오후 1시 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
-        f"타임당 최대 {MAX_PER_SLOT}명(구역장+동반자 합산)까지 신청 가능합니다.\n\n"
+        f"타임당 최대 {MAX_PER_SLOT}건, 한 건당 최대 {MAX_PER_SIGNUP}명(구역장+동반자)까지 신청 가능합니다.\n\n"
         "아래에서 원하시는 시간대를 선택해주세요.",
         reply_markup=hour_keyboard(prefix="req_"),
     )
@@ -520,27 +521,17 @@ async def companions_entered(update: Update, context: ContextTypes.DEFAULT_TYPE)
     companions = update.message.text.strip()
     headcount = signup_headcount(companions)
 
-    if headcount > MAX_PER_SLOT:
+    if headcount > MAX_PER_SIGNUP:
         await update.message.reply_text(
-            f"한 타임 최대 인원은 {MAX_PER_SLOT}명이에요 (구역장 포함). "
+            f"신청 한 건당 최대 인원은 {MAX_PER_SIGNUP}명이에요 (구역장 포함). "
             f"입력하신 인원은 총 {headcount}명이라 넘어가요.\n"
             "동반자 수를 줄여서 다시 입력해주세요."
         )
         return ENTER_COMPANIONS
 
-    slot = context.user_data["slot_time"]
-    current = get_slot_headcount(slot)
-    if current + headcount > MAX_PER_SLOT:
-        remaining = max(MAX_PER_SLOT - current, 0)
-        await update.message.reply_text(
-            f"'{slot}' 타임에 남은 자리가 {remaining}명뿐이에요 (입력하신 인원 총 {headcount}명).\n"
-            "동반자 수를 줄이거나, 다른 타임을 선택해주세요.\n"
-            "(동반자 수를 줄이려면 다시 입력, 다른 타임을 원하시면 '취소' 입력 후 재시작해주세요)"
-        )
-        return ENTER_COMPANIONS
-
     context.user_data["companions"] = companions
 
+    slot = context.user_data["slot_time"]
     name = context.user_data["rep_name"]
     phone = context.user_data["phone"]
     group_name = context.user_data["group_name"]
@@ -590,7 +581,8 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if signup_id is None:
         await query.edit_message_text(
-            "😥 죄송해요, 방금 사이에 정원이 다 찼어요.\n'신청시작' 버튼으로 다른 타임을 선택해주세요."
+            "😥 죄송해요, 방금 사이에 이 타임 정원(10건)이 다 찼어요.\n"
+            "'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
     else:
         headcount = signup_headcount(companions)
@@ -737,10 +729,9 @@ async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         for m in MINUTES:
             slot = f"{hour:02d}:{m:02d}"
             entries = by_slot.get(slot, [])
-            filled = sum(signup_headcount(e["companions"]) for e in entries)
             checked_cnt = sum(1 for e in entries if e["checked_in"])
             lines.append(
-                f"\n▶ {slot} — {filled}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}명)"
+                f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}건 (참여완료 {checked_cnt}건)"
             )
             for e in entries:
                 status = "✅" if e["checked_in"] else "⏳"
