@@ -628,7 +628,7 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = phone
     await update.message.reply_text(
         "같이 갈 구역원이 있다면 이름을 콤마(,)로 구분해서 입력해주세요.\n"
-        "예: 김혜림,장희연,강유전\n"
+        "예: 김시몬,장알곡,강천사\n"
         "없으면 '없음'이라고 입력해주세요."
     )
     return ENTER_COMPANIONS
