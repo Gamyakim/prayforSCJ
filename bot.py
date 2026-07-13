@@ -2,10 +2,10 @@
 """
 기도회 신청 텔레그램 봇
 - 오후 1시~8시, 10분 단위 타임슬롯 (총 42개)
-- 슬롯당 최대 10명(대표자 기준)
-- 대표자 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자 입력
+- 슬롯당 최대 10명 (구역장 1명 + 동반자 인원 합산 기준)
+- 회/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
-- 관리자는 버튼/텍스트로 타임별 명단 조회, 삭제, 제목 설정
+- 관리자는 버튼/텍스트로 타임별 명단 조회, 삭제, 제목 설정, 관리자 추가/삭제
 - 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
 """
 
@@ -68,14 +68,15 @@ ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-MAX_PER_SLOT = 10
+MAX_PER_SLOT = 10  # 10분 슬롯당 최대 인원 (구역장 + 동반자 합산)
 HOURS = list(range(13, 20))  # 13시 ~ 19시 (각 시간당 6개 슬롯, 마지막 슬롯 19:50)
 MINUTES = [0, 10, 20, 30, 40, 50]
+HOUR_CAPACITY = MAX_PER_SLOT * len(MINUTES)
 
 PHONE_PATTERN = re.compile(r"^01[016789]-\d{3,4}-\d{4}$")
 
 # 대화 상태
-SELECT_SLOT, ENTER_NAME, ENTER_PHONE, ENTER_COMPANIONS, CONFIRM = range(5)
+SELECT_SLOT, ENTER_GROUP, ENTER_LEADER, ENTER_PHONE, ENTER_COMPANIONS, CONFIRM = range(6)
 
 DEFAULT_EVENT_TITLE = "릴레이 기도회"
 
@@ -141,6 +142,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS signups (
                 id SERIAL PRIMARY KEY,
                 slot_time TEXT NOT NULL,
+                group_name TEXT NOT NULL DEFAULT '',
                 rep_name TEXT NOT NULL,
                 phone TEXT NOT NULL,
                 companions TEXT,
@@ -152,6 +154,8 @@ def init_db():
             )
             """
         )
+        # 기존 배포 DB에 group_name 컬럼이 없을 수 있어 안전하게 추가
+        cur.execute("ALTER TABLE signups ADD COLUMN IF NOT EXISTS group_name TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -201,41 +205,73 @@ def set_setting(key: str, value: str):
         conn.close()
 
 
-def count_slot(slot_time: str) -> int:
+# ---------------------------------------------------------------------------
+# 인원수 계산 유틸 (구역장 1명 + 동반자 콤마 구분 인원)
+# ---------------------------------------------------------------------------
+def companion_count(companions: str) -> int:
+    s = (companions or "").strip()
+    if not s or s == "없음":
+        return 0
+    return len([c for c in s.split(",") if c.strip()])
+
+
+def signup_headcount(companions: str) -> int:
+    return 1 + companion_count(companions)
+
+
+def get_slot_headcount(slot_time: str) -> int:
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
+            "SELECT companions FROM signups WHERE slot_time = %s", (slot_time,)
         )
-        return cur.fetchone()["cnt"]
+        rows = cur.fetchall()
+        return sum(signup_headcount(r["companions"]) for r in rows)
     finally:
         conn.close()
 
 
-def insert_signup(slot_time, rep_name, phone, companions, user_id, username):
-    """정원 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
+def get_hour_headcount(hour: int) -> int:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        prefix = f"{hour:02d}:"
+        cur.execute(
+            "SELECT companions FROM signups WHERE slot_time LIKE %s", (f"{prefix}%",)
+        )
+        rows = cur.fetchall()
+        return sum(signup_headcount(r["companions"]) for r in rows)
+    finally:
+        conn.close()
+
+
+def insert_signup(slot_time, group_name, rep_name, phone, companions, user_id, username):
+    """정원(인원수 기준) 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
     테이블 락으로 동시 신청 시에도 정원이 초과되지 않도록 보장."""
+    new_headcount = signup_headcount(companions)
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("LOCK TABLE signups IN SHARE ROW EXCLUSIVE MODE")
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
+            "SELECT companions FROM signups WHERE slot_time = %s", (slot_time,)
         )
-        cnt = cur.fetchone()["cnt"]
-        if cnt >= MAX_PER_SLOT:
+        rows = cur.fetchall()
+        current_headcount = sum(signup_headcount(r["companions"]) for r in rows)
+        if current_headcount + new_headcount > MAX_PER_SLOT:
             conn.rollback()
             return None
         cur.execute(
             """
             INSERT INTO signups
-                (slot_time, rep_name, phone, companions, telegram_user_id, telegram_username, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (slot_time, group_name, rep_name, phone, companions, telegram_user_id, telegram_username, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (
                 slot_time,
+                group_name,
                 rep_name,
                 phone,
                 companions,
@@ -348,11 +384,20 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 
 def hour_keyboard(prefix: str):
-    """1시~7시(19시) 선택 키보드. prefix로 신청용/관리자용 콜백 구분."""
+    """1시~7시(19시) 선택 키보드. prefix로 신청용/관리자용 콜백 구분.
+    신청용(prefix='req_')일 때는 시간대별 잔여 인원을 같이 보여준다."""
+    show_capacity = prefix == "req_"
     buttons = []
     row = []
     for h in HOURS:
-        row.append(InlineKeyboardButton(f"{h}시", callback_data=f"{prefix}hour_{h}"))
+        if show_capacity:
+            filled = get_hour_headcount(h)
+            label = f"{h}시({filled}/{HOUR_CAPACITY}명)"
+            if filled >= HOUR_CAPACITY:
+                label += " 마감"
+        else:
+            label = f"{h}시"
+        row.append(InlineKeyboardButton(label, callback_data=f"{prefix}hour_{h}"))
         if len(row) == 3:
             buttons.append(row)
             row = []
@@ -366,9 +411,9 @@ def slot_keyboard_for_hour(hour: int):
     row = []
     for m in MINUTES:
         slot = f"{hour:02d}:{m:02d}"
-        cnt = count_slot(slot)
-        label = f"{slot} ({cnt}/{MAX_PER_SLOT})" + (" 마감" if cnt >= MAX_PER_SLOT else "")
-        cb = "full" if cnt >= MAX_PER_SLOT else f"slot_{slot}"
+        filled = get_slot_headcount(slot)
+        label = f"{slot} ({filled}/{MAX_PER_SLOT})" + (" 마감" if filled >= MAX_PER_SLOT else "")
+        cb = "full" if filled >= MAX_PER_SLOT else f"slot_{slot}"
         row.append(InlineKeyboardButton(label, callback_data=cb))
         if len(row) == 2:
             buttons.append(row)
@@ -390,7 +435,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         "오후 1시 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
-        "타임당 최대 10명(대표자 기준)까지 신청 가능합니다.\n\n"
+        f"타임당 최대 {MAX_PER_SLOT}명(구역장+동반자 합산)까지 신청 가능합니다.\n\n"
         "아래에서 원하시는 시간대를 선택해주세요.",
         reply_markup=hour_keyboard(prefix="req_"),
     )
@@ -428,16 +473,26 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slot = query.data.split("_", 1)[1]
     context.user_data["slot_time"] = slot
     await query.edit_message_text(
-        f"선택하신 타임: {slot}\n\n대표자 이름을 입력해주세요."
+        f"선택하신 타임: {slot}\n\n회/구역명을 입력해주세요."
     )
-    return ENTER_NAME
+    return ENTER_GROUP
 
 
-async def name_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    group_name = update.message.text.strip()
+    if not group_name:
+        await update.message.reply_text("회/구역명을 입력해주세요.")
+        return ENTER_GROUP
+    context.user_data["group_name"] = group_name
+    await update.message.reply_text("구역장 이름을 입력해주세요.")
+    return ENTER_LEADER
+
+
+async def leader_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("이름을 입력해주세요.")
-        return ENTER_NAME
+        await update.message.reply_text("구역장 이름을 입력해주세요.")
+        return ENTER_LEADER
     context.user_data["rep_name"] = name
     await update.message.reply_text(
         "연락처를 입력해주세요.\n형식: 010-1234-5678"
@@ -454,25 +509,49 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTER_PHONE
     context.user_data["phone"] = phone
     await update.message.reply_text(
-        "같이 갈 사람이 있다면 이름을 입력해주세요.\n없으면 '없음'이라고 입력해주세요."
+        "같이 갈 구역원이 있다면 이름을 콤마(,)로 구분해서 입력해주세요.\n"
+        "예: 김혜림,장희연,강유전\n"
+        "없으면 '없음'이라고 입력해주세요."
     )
     return ENTER_COMPANIONS
 
 
 async def companions_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     companions = update.message.text.strip()
-    context.user_data["companions"] = companions
+    headcount = signup_headcount(companions)
+
+    if headcount > MAX_PER_SLOT:
+        await update.message.reply_text(
+            f"한 타임 최대 인원은 {MAX_PER_SLOT}명이에요 (구역장 포함). "
+            f"입력하신 인원은 총 {headcount}명이라 넘어가요.\n"
+            "동반자 수를 줄여서 다시 입력해주세요."
+        )
+        return ENTER_COMPANIONS
 
     slot = context.user_data["slot_time"]
+    current = get_slot_headcount(slot)
+    if current + headcount > MAX_PER_SLOT:
+        remaining = max(MAX_PER_SLOT - current, 0)
+        await update.message.reply_text(
+            f"'{slot}' 타임에 남은 자리가 {remaining}명뿐이에요 (입력하신 인원 총 {headcount}명).\n"
+            "동반자 수를 줄이거나, 다른 타임을 선택해주세요.\n"
+            "(동반자 수를 줄이려면 다시 입력, 다른 타임을 원하시면 '취소' 입력 후 재시작해주세요)"
+        )
+        return ENTER_COMPANIONS
+
+    context.user_data["companions"] = companions
+
     name = context.user_data["rep_name"]
     phone = context.user_data["phone"]
+    group_name = context.user_data["group_name"]
 
     summary = (
         "📋 신청 내용을 확인해주세요.\n\n"
         f"⏰ 시간: {slot}\n"
-        f"👤 대표자: {name}\n"
+        f"🏠 회/구역: {group_name}\n"
+        f"👤 구역장: {name}\n"
         f"📞 연락처: {phone}\n"
-        f"👥 같이 가는 사람: {companions}\n\n"
+        f"👥 같이 가는 사람: {companions} (총 {headcount}명)\n\n"
         "제출하시겠어요?"
     )
     keyboard = InlineKeyboardMarkup(
@@ -492,31 +571,35 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     slot = context.user_data.get("slot_time")
+    group_name = context.user_data.get("group_name")
     name = context.user_data.get("rep_name")
     phone = context.user_data.get("phone")
     companions = context.user_data.get("companions")
     user = query.from_user
 
     logger.info(
-        "[제출 시도] user_id=%s username=%s slot=%s name=%s",
-        user.id, user.username, slot, name,
+        "[제출 시도] user_id=%s username=%s slot=%s group=%s name=%s companions=%s",
+        user.id, user.username, slot, group_name, name, companions,
     )
 
-    signup_id = insert_signup(slot, name, phone, companions, user.id, user.username or "")
+    signup_id = insert_signup(
+        slot, group_name, name, phone, companions, user.id, user.username or ""
+    )
 
     logger.info("[제출 결과] user_id=%s -> signup_id=%s", user.id, signup_id)
 
     if signup_id is None:
         await query.edit_message_text(
-            "😥 죄송해요, 방금 정원이 다 찼어요.\n'신청시작' 버튼으로 다른 타임을 선택해주세요."
+            "😥 죄송해요, 방금 사이에 정원이 다 찼어요.\n'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
     else:
+        headcount = signup_headcount(companions)
         checkin_keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🙋 참여완료", callback_data=f"checkin_{signup_id}")]]
         )
         await query.edit_message_text(
             f"✅ 신청 완료되었습니다!\n\n"
-            f"⏰ {slot} / 👤 {name} / 👥 {companions}\n\n"
+            f"⏰ {slot} / 🏠 {group_name} / 👤 {name} / 👥 {companions} (총 {headcount}명)\n\n"
             "신청해주셔서 감사합니다 🙏\n\n"
             "기도회에 실제로 참여하신 후 아래 버튼을 눌러주세요.",
             reply_markup=checkin_keyboard,
@@ -583,11 +666,13 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     for r in rows:
         status = "✅ 참여완료" if r["checked_in"] else "⏳ 참여 전"
+        headcount = signup_headcount(r["companions"])
         text = (
             f"⏰ {r['slot_time']}\n"
-            f"👤 대표자: {r['rep_name']}\n"
+            f"🏠 회/구역: {r['group_name']}\n"
+            f"👤 구역장: {r['rep_name']}\n"
             f"📞 연락처: {r['phone']}\n"
-            f"👥 동반자: {r['companions']}\n"
+            f"👥 동반자: {r['companions']} (총 {headcount}명)\n"
             f"상태: {status}"
         )
         keyboard = InlineKeyboardMarkup(
@@ -652,14 +737,17 @@ async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
         for m in MINUTES:
             slot = f"{hour:02d}:{m:02d}"
             entries = by_slot.get(slot, [])
+            filled = sum(signup_headcount(e["companions"]) for e in entries)
             checked_cnt = sum(1 for e in entries if e["checked_in"])
             lines.append(
-                f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}명)"
+                f"\n▶ {slot} — {filled}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}명)"
             )
             for e in entries:
                 status = "✅" if e["checked_in"] else "⏳"
+                hc = signup_headcount(e["companions"])
                 lines.append(
-                    f"  {status} [{e['id']}] {e['rep_name']} / {e['phone']} / 동반자: {e['companions']}"
+                    f"  {status} [{e['id']}] {e['group_name']} / {e['rep_name']} / "
+                    f"{e['phone']} / 동반자: {e['companions']} (총 {hc}명)"
                 )
         lines.append("\n삭제하려면 '삭제 (번호)' 형식으로 입력해주세요. 예: 삭제 3")
         text = "\n".join(lines)
@@ -859,7 +947,8 @@ def main():
                 CallbackQueryHandler(full_slot_clicked, pattern=r"^full$"),
                 CallbackQueryHandler(slot_selected, pattern=r"^slot_\d{2}:\d{2}$"),
             ],
-            ENTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_entered)],
+            ENTER_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_entered)],
+            ENTER_LEADER: [MessageHandler(filters.TEXT & ~filters.COMMAND, leader_entered)],
             ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_entered)],
             ENTER_COMPANIONS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, companions_entered)
