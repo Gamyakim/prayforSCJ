@@ -12,6 +12,8 @@
 
 import os
 import re
+import json
+import asyncio
 import logging
 import threading
 from datetime import datetime
@@ -19,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import psycopg2
 import psycopg2.extras
+import gspread
+from google.oauth2.service_account import Credentials
 
 from telegram import (
     InlineKeyboardButton,
@@ -370,6 +374,113 @@ def delete_signup_by_owner(signup_id: int, requester_user_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 구글 시트 연동 (선택 사항 - 환경변수 없으면 자동으로 비활성화)
+# ---------------------------------------------------------------------------
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "")
+GOOGLE_SHEETS_CREDENTIALS_JSON = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "")
+
+_sheet_cache = {"ws": None, "tried": False}
+
+
+def _load_google_credentials():
+    if not GOOGLE_SHEETS_CREDENTIALS_JSON:
+        return None
+    try:
+        info = json.loads(GOOGLE_SHEETS_CREDENTIALS_JSON)
+    except json.JSONDecodeError:
+        logger.warning("GOOGLE_SHEETS_CREDENTIALS_JSON 파싱에 실패했어요. JSON 형식을 확인해주세요.")
+        return None
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    return Credentials.from_service_account_info(info, scopes=scopes)
+
+
+def _ensure_sheet_header(ws):
+    try:
+        first_row = ws.row_values(1)
+        if not first_row:
+            ws.append_row(
+                ["ID", "시간", "회/구역", "구역장", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
+            )
+    except Exception:
+        logger.exception("구글 시트 헤더 설정 실패")
+
+
+def _get_worksheet():
+    """구글 시트 워크시트를 가져온다. 설정이 없거나 연결 실패 시 None 반환 (봇 동작에는 영향 없음)."""
+    if _sheet_cache["ws"] is not None:
+        return _sheet_cache["ws"]
+    if _sheet_cache["tried"]:
+        return None
+    _sheet_cache["tried"] = True
+
+    if not GOOGLE_SHEET_ID:
+        logger.info("GOOGLE_SHEET_ID가 설정되지 않아 구글 시트 연동을 건너뜁니다.")
+        return None
+    creds = _load_google_credentials()
+    if not creds:
+        logger.info("구글 시트 인증 정보가 없어 연동을 건너뜁니다.")
+        return None
+    try:
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        ws = sh.sheet1
+        _ensure_sheet_header(ws)
+        _sheet_cache["ws"] = ws
+        logger.info("구글 시트 연동 성공")
+        return ws
+    except Exception:
+        logger.exception("구글 시트 연결 실패")
+        return None
+
+
+def sheet_append_signup(signup_id, slot, group_name, rep_name, phone, companions, headcount, created_at):
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    try:
+        ws.append_row(
+            [str(signup_id), slot, group_name, rep_name, phone, companions, headcount, "⏳", created_at]
+        )
+    except Exception:
+        logger.exception("구글 시트 기록 실패 (signup_id=%s)", signup_id)
+
+
+def _find_sheet_row_by_id(ws, signup_id):
+    try:
+        cell = ws.find(str(signup_id), in_column=1)
+        return cell.row if cell else None
+    except Exception:
+        logger.exception("구글 시트에서 행 찾기 실패 (signup_id=%s)", signup_id)
+        return None
+
+
+def sheet_update_checkin(signup_id):
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    row = _find_sheet_row_by_id(ws, signup_id)
+    if row is None:
+        return
+    try:
+        ws.update_cell(row, 8, "✅")
+    except Exception:
+        logger.exception("구글 시트 참여완료 업데이트 실패 (signup_id=%s)", signup_id)
+
+
+def sheet_delete_row(signup_id):
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    row = _find_sheet_row_by_id(ws, signup_id)
+    if row is None:
+        return
+    try:
+        ws.delete_rows(row)
+    except Exception:
+        logger.exception("구글 시트 행 삭제 실패 (signup_id=%s)", signup_id)
+
+
+# ---------------------------------------------------------------------------
 # 유틸
 # ---------------------------------------------------------------------------
 def is_admin(user_id: int) -> bool:
@@ -586,6 +697,11 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         headcount = signup_headcount(companions)
+        await asyncio.to_thread(
+            sheet_append_signup,
+            signup_id, slot, group_name, name, phone, companions, headcount,
+            datetime.now().isoformat(timespec="seconds"),
+        )
         checkin_keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🙋 참여완료", callback_data=f"checkin_{signup_id}")]]
         )
@@ -619,6 +735,8 @@ async def checkin_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result == "already":
         await query.answer("이미 참여완료 처리되었어요 🙏", show_alert=True)
         return
+
+    await asyncio.to_thread(sheet_update_checkin, signup_id)
 
     await query.answer("참여 체크 완료! 감사합니다 🙏")
     original_text = query.message.text or ""
@@ -686,6 +804,8 @@ async def user_cancel_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE
     if result == "not_owner":
         await query.answer("본인 신청 건만 취소할 수 있어요.", show_alert=True)
         return
+
+    await asyncio.to_thread(sheet_delete_row, signup_id)
 
     await query.answer("신청이 취소되었어요.")
     original_text = query.message.text or ""
@@ -771,6 +891,7 @@ async def admin_delete_signup(update: Update, context: ContextTypes.DEFAULT_TYPE
     signup_id = int(match.group(1))
     deleted = delete_signup(signup_id)
     if deleted:
+        await asyncio.to_thread(sheet_delete_row, signup_id)
         await update.message.reply_text(f"🗑 [{signup_id}]번 신청을 삭제했습니다.")
     else:
         await update.message.reply_text(f"[{signup_id}]번 신청을 찾을 수 없어요.")
