@@ -3,7 +3,7 @@
 기도회 신청 텔레그램 봇
 - 오후 5시40분~8시(17:40~19:50), 10분 단위 타임슬롯 (17시는 40/50분만, 18~19시는 정시부터)
 - 슬롯당 최대 10명 (구역장 1명 + 동반자 합산 인원 기준)
-- 회/지역/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
+- 회/팀/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
 - 관리자는 버튼/텍스트로 타임별 명단 조회, 전체 명단, 삭제, 제목 설정, 관리자 추가/삭제
 - 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
@@ -414,11 +414,11 @@ def _load_google_credentials():
 
 def _ensure_sheet_header(ws):
     try:
-        expected = ["ID", "시간", "회/지역/구역", "구역장", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
+        expected = ["ID", "시간", "회/팀/구역", "구역장", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
         first_row = ws.row_values(1)
         if not first_row:
             ws.append_row(expected)
-        elif len(first_row) >= 3 and first_row[2] != "회/지역/구역":
+        elif len(first_row) >= 3 and first_row[2] != "회/팀/구역":
             # 예전 헤더("회/구역" 등)가 이미 있으면 새 문구로 갱신
             ws.update("A1", [expected])
     except Exception:
@@ -600,7 +600,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slot = query.data.split("_", 1)[1]
     context.user_data["slot_time"] = slot
     await query.edit_message_text(
-        f"선택하신 타임: {slot}\n\n회/지역/구역명을 입력해주세요."
+        f"선택하신 타임: {slot}\n\n회/팀/구역명을 입력해주세요."
     )
     return ENTER_GROUP
 
@@ -608,7 +608,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_name = update.message.text.strip()
     if not group_name:
-        await update.message.reply_text("회/지역/구역명을 입력해주세요.")
+        await update.message.reply_text("회/팀/구역명을 입력해주세요.")
         return ENTER_GROUP
     context.user_data["group_name"] = group_name
     await update.message.reply_text("구역장 이름을 입력해주세요.")
@@ -690,7 +690,7 @@ async def _finalize_companions(message, context, companions: str):
     summary = (
         "📋 신청 내용을 확인해주세요.\n\n"
         f"⏰ 시간: {slot}\n"
-        f"🏠 회/지역/구역: {group_name}\n"
+        f"🏠 회/팀/구역: {group_name}\n"
         f"👤 구역장: {name}\n"
         f"📞 연락처: {phone}\n"
         f"👥 같이 가는 사람: {companions} (총 {headcount}명)\n\n"
@@ -851,7 +851,7 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         headcount = signup_headcount(r["companions"])
         text = (
             f"⏰ {r['slot_time']}\n"
-            f"🏠 회/지역/구역: {r['group_name']}\n"
+            f"🏠 회/팀/구역: {r['group_name']}\n"
             f"👤 구역장: {r['rep_name']}\n"
             f"📞 연락처: {r['phone']}\n"
             f"👥 동반자: {r['companions']} (총 {headcount}명)\n"
