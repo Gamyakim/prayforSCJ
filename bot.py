@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 기도회 신청 텔레그램 봇
-- 오후 1시~8시, 10분 단위 타임슬롯 (총 42개)
-- 슬롯당 최대 10건 신청 가능 (신청 건수 기준)
-- 한 건의 신청 안에서는 구역장 + 동반자 합쳐 10명을 넘을 수 없음
+- 오후 5시40분~8시(17:40~19:50), 10분 단위 타임슬롯 (17시는 40/50분만, 18~19시는 정시부터)
+- 슬롯당 최대 10명 (구역장 1명 + 동반자 합산 인원 기준)
 - 회/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
-- 관리자는 버튼/텍스트로 타임별 명단 조회, 삭제, 제목 설정, 관리자 추가/삭제
+- 관리자는 버튼/텍스트로 타임별 명단 조회, 전체 명단, 삭제, 제목 설정, 관리자 추가/삭제
 - 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
+- 구글 시트 실시간 미러링 (선택 사항 - 환경변수 없으면 자동 비활성화)
 """
 
 import os
@@ -30,6 +30,7 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
+    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -73,11 +74,29 @@ ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-MAX_PER_SLOT = 10       # 10분 슬롯당 최대 신청 "건수"
-MAX_PER_SIGNUP = 10     # 신청 한 건당 최대 인원 (구역장 + 동반자 합산)
-HOURS = list(range(13, 20))  # 13시 ~ 19시 (각 시간당 6개 슬롯, 마지막 슬롯 19:50)
-MINUTES = [0, 10, 20, 30, 40, 50]
-HOUR_CAPACITY = MAX_PER_SLOT * len(MINUTES)
+# 동반자 입력용 미니앱(WebApp) 주소. Render가 자동으로 넣어주는 RENDER_EXTERNAL_URL을
+# 우선 쓰고, 없으면 WEBAPP_BASE_URL을 직접 지정할 수 있게 함. 둘 다 없으면 버튼 없이
+# 콤마 직접 입력 방식만 안내한다.
+WEBAPP_BASE_URL = (
+    os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    or os.environ.get("WEBAPP_BASE_URL", "").rstrip("/")
+)
+
+MAX_PER_SLOT = 10  # 10분 슬롯당 최대 "인원" (구역장 + 동반자 합산)
+
+# 운영 시간: 17:40 ~ 19:50
+# 17시는 40분/50분만, 18시/19시는 정시부터 10분 단위 전체
+HOUR_MINUTES = {
+    17: [40, 50],
+    18: [0, 10, 20, 30, 40, 50],
+    19: [0, 10, 20, 30, 40, 50],
+}
+HOURS = list(HOUR_MINUTES.keys())
+
+
+def hour_capacity(hour: int) -> int:
+    return len(HOUR_MINUTES.get(hour, [])) * MAX_PER_SLOT
+
 
 PHONE_PATTERN = re.compile(r"^01[016789]-\d{3,4}-\d{4}$")
 
@@ -160,7 +179,6 @@ def init_db():
             )
             """
         )
-        # 기존 배포 DB에 group_name 컬럼이 없을 수 있어 안전하게 추가
         cur.execute("ALTER TABLE signups ADD COLUMN IF NOT EXISTS group_name TEXT NOT NULL DEFAULT ''")
         cur.execute(
             """
@@ -212,7 +230,7 @@ def set_setting(key: str, value: str):
 
 
 # ---------------------------------------------------------------------------
-# 동반자(콤마 구분) 인원수 계산 유틸 - 한 건당 인원 제한 검증용
+# 동반자(콤마 구분) 인원수 계산 유틸
 # ---------------------------------------------------------------------------
 def companion_count(companions: str) -> int:
     s = (companions or "").strip()
@@ -226,45 +244,43 @@ def signup_headcount(companions: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 슬롯 정원 = 신청 "건수" 기준 (10건)
+# 슬롯 정원 = 인원수(구역장+동반자) 기준 (10명)
 # ---------------------------------------------------------------------------
-def count_slot(slot_time: str) -> int:
+def get_slot_headcount(slot_time: str) -> int:
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
-        )
-        return cur.fetchone()["cnt"]
+        cur.execute("SELECT companions FROM signups WHERE slot_time = %s", (slot_time,))
+        rows = cur.fetchall()
+        return sum(signup_headcount(r["companions"]) for r in rows)
     finally:
         conn.close()
 
 
-def count_hour(hour: int) -> int:
+def get_hour_headcount(hour: int) -> int:
     conn = get_conn()
     try:
         cur = conn.cursor()
         prefix = f"{hour:02d}:"
-        cur.execute(
-            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time LIKE %s", (f"{prefix}%",)
-        )
-        return cur.fetchone()["cnt"]
+        cur.execute("SELECT companions FROM signups WHERE slot_time LIKE %s", (f"{prefix}%",))
+        rows = cur.fetchall()
+        return sum(signup_headcount(r["companions"]) for r in rows)
     finally:
         conn.close()
 
 
 def insert_signup(slot_time, group_name, rep_name, phone, companions, user_id, username):
-    """슬롯 정원(신청 건수 10건) 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
+    """슬롯 정원(인원수 10명) 체크 후 삽입. 성공하면 새 신청의 id, 정원 초과면 None을 반환.
     테이블 락으로 동시 신청 시에도 정원이 초과되지 않도록 보장."""
+    new_headcount = signup_headcount(companions)
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute("LOCK TABLE signups IN SHARE ROW EXCLUSIVE MODE")
-        cur.execute(
-            "SELECT COUNT(*) AS cnt FROM signups WHERE slot_time = %s", (slot_time,)
-        )
-        cnt = cur.fetchone()["cnt"]
-        if cnt >= MAX_PER_SLOT:
+        cur.execute("SELECT companions FROM signups WHERE slot_time = %s", (slot_time,))
+        rows = cur.fetchall()
+        current_headcount = sum(signup_headcount(r["companions"]) for r in rows)
+        if current_headcount + new_headcount > MAX_PER_SLOT:
             conn.rollback()
             return None
         cur.execute(
@@ -275,14 +291,8 @@ def insert_signup(slot_time, group_name, rep_name, phone, companions, user_id, u
             RETURNING id
             """,
             (
-                slot_time,
-                group_name,
-                rep_name,
-                phone,
-                companions,
-                user_id,
-                username,
-                datetime.now().isoformat(timespec="seconds"),
+                slot_time, group_name, rep_name, phone, companions,
+                user_id, username, datetime.now().isoformat(timespec="seconds"),
             ),
         )
         new_id = cur.fetchone()["id"]
@@ -353,7 +363,6 @@ def get_signups_for_user(user_id: int):
 
 
 def delete_signup(signup_id: int) -> bool:
-    """신청 건 삭제. 삭제됐으면 True, 존재하지 않으면 False."""
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -366,7 +375,6 @@ def delete_signup(signup_id: int) -> bool:
 
 
 def delete_signup_by_owner(signup_id: int, requester_user_id: int) -> str:
-    """본인 확인 후 삭제. 결과를 ('ok'|'not_owner'|'not_found') 형태로 반환."""
     conn = get_conn()
     try:
         cur = conn.cursor()
@@ -416,7 +424,6 @@ def _ensure_sheet_header(ws):
 
 
 def _get_worksheet():
-    """구글 시트 워크시트를 가져온다. 설정이 없거나 연결 실패 시 None 반환 (봇 동작에는 영향 없음)."""
     if _sheet_cache["ws"] is not None:
         return _sheet_cache["ws"]
     if _sheet_cache["tried"]:
@@ -506,14 +513,14 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 
 def hour_keyboard(prefix: str):
-    """1시~7시(19시) 선택 키보드. prefix로 신청용/관리자용 콜백 구분.
-    신청용/관리자용 모두 시간대별 신청 건수 현황을 같이 보여준다."""
+    """운영 시간(17~19시) 선택 키보드. 시간대별 인원 현황을 같이 보여준다."""
     buttons = []
     row = []
     for h in HOURS:
-        filled = count_hour(h)
-        label = f"{h}시({filled}/{HOUR_CAPACITY}건)"
-        if filled >= HOUR_CAPACITY:
+        filled = get_hour_headcount(h)
+        cap = hour_capacity(h)
+        label = f"{h}시({filled}/{cap}명)"
+        if filled >= cap:
             label += " 마감"
         row.append(InlineKeyboardButton(label, callback_data=f"{prefix}hour_{h}"))
         if len(row) == 3:
@@ -527,11 +534,11 @@ def hour_keyboard(prefix: str):
 def slot_keyboard_for_hour(hour: int):
     buttons = []
     row = []
-    for m in MINUTES:
+    for m in HOUR_MINUTES.get(hour, []):
         slot = f"{hour:02d}:{m:02d}"
-        cnt = count_slot(slot)
-        label = f"{slot} ({cnt}/{MAX_PER_SLOT})" + (" 마감" if cnt >= MAX_PER_SLOT else "")
-        cb = "full" if cnt >= MAX_PER_SLOT else f"slot_{slot}"
+        filled = get_slot_headcount(slot)
+        label = f"{slot} ({filled}/{MAX_PER_SLOT})" + (" 마감" if filled >= MAX_PER_SLOT else "")
+        cb = "full" if filled >= MAX_PER_SLOT else f"slot_{slot}"
         row.append(InlineKeyboardButton(label, callback_data=cb))
         if len(row) == 2:
             buttons.append(row)
@@ -552,8 +559,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU_KEYBOARD,
     )
     await update.message.reply_text(
-        "오후 1시 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
-        f"타임당 최대 {MAX_PER_SLOT}건, 한 건당 최대 {MAX_PER_SIGNUP}명(구역장+동반자)까지 신청 가능합니다.\n\n"
+        "오후 5시40분 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
+        f"타임당 최대 {MAX_PER_SLOT}명(구역장+동반자 합산)까지 신청 가능합니다.\n\n"
         "아래에서 원하시는 시간대를 선택해주세요.",
         reply_markup=hour_keyboard(prefix="req_"),
     )
@@ -626,29 +633,51 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ENTER_PHONE
     context.user_data["phone"] = phone
-    await update.message.reply_text(
-        "같이 갈 구역원이 있다면 이름을 콤마(,)로 구분해서 입력해주세요.\n"
-        "예: 김시몬,장알곡,강천사\n"
+
+    text = (
+        "같이 갈 구역원이 있으면 알려주세요.\n\n"
+        "아래 버튼을 눌러 팝업창에서 한 명씩 입력하시거나,\n"
+        "콤마(,)로 구분해서 텍스트로 바로 입력하셔도 돼요.\n"
+        "예: 김OO,이OO,박OO\n"
         "없으면 '없음'이라고 입력해주세요."
     )
+    if WEBAPP_BASE_URL:
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                "📝 동반자 입력하기",
+                web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp"),
+            )]]
+        )
+        await update.message.reply_text(text, reply_markup=keyboard)
+    else:
+        await update.message.reply_text(text)
     return ENTER_COMPANIONS
 
 
-async def companions_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    companions = update.message.text.strip()
+async def _finalize_companions(message, context, companions: str):
+    """콤마 입력이든 미니앱 제출이든 공통으로 인원 검증 후 확인 화면을 보여준다."""
     headcount = signup_headcount(companions)
 
-    if headcount > MAX_PER_SIGNUP:
-        await update.message.reply_text(
-            f"신청 한 건당 최대 인원은 {MAX_PER_SIGNUP}명이에요 (구역장 포함). "
+    if headcount > MAX_PER_SLOT:
+        await message.reply_text(
+            f"한 타임 최대 인원은 {MAX_PER_SLOT}명이에요 (구역장 포함). "
             f"입력하신 인원은 총 {headcount}명이라 넘어가요.\n"
             "동반자 수를 줄여서 다시 입력해주세요."
         )
         return ENTER_COMPANIONS
 
+    slot = context.user_data["slot_time"]
+    current = get_slot_headcount(slot)
+    if current + headcount > MAX_PER_SLOT:
+        remaining = max(MAX_PER_SLOT - current, 0)
+        await message.reply_text(
+            f"'{slot}' 타임에 남은 자리가 {remaining}명뿐이에요 (입력하신 인원 총 {headcount}명).\n"
+            "동반자 수를 줄이거나, '취소' 입력 후 다른 타임을 선택해주세요."
+        )
+        return ENTER_COMPANIONS
+
     context.user_data["companions"] = companions
 
-    slot = context.user_data["slot_time"]
     name = context.user_data["rep_name"]
     phone = context.user_data["phone"]
     group_name = context.user_data["group_name"]
@@ -670,8 +699,25 @@ async def companions_entered(update: Update, context: ContextTypes.DEFAULT_TYPE)
             ]
         ]
     )
-    await update.message.reply_text(summary, reply_markup=keyboard)
+    await message.reply_text(summary, reply_markup=keyboard)
     return CONFIRM
+
+
+async def companions_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    companions = update.message.text.strip()
+    return await _finalize_companions(update.message, context, companions)
+
+
+async def companions_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.effective_message.web_app_data.data
+    try:
+        names = json.loads(raw)
+        names = [n.strip() for n in names if isinstance(n, str) and n.strip()]
+    except Exception:
+        logger.exception("미니앱에서 받은 동반자 데이터 파싱 실패: %s", raw)
+        names = []
+    companions = ",".join(names) if names else "없음"
+    return await _finalize_companions(update.effective_message, context, companions)
 
 
 async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -698,7 +744,7 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if signup_id is None:
         await query.edit_message_text(
-            "😥 죄송해요, 방금 사이에 이 타임 정원(10건)이 다 찼어요.\n"
+            "😥 죄송해요, 방금 사이에 정원이 다 찼어요.\n"
             "'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
     else:
@@ -835,46 +881,6 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    if not is_admin(query.from_user.id):
-        await query.answer("관리자만 사용할 수 있어요.", show_alert=True)
-        return
-    await query.answer()
-    hour = int(query.data.split("_")[-1])
-    rows = get_signups_for_hour(hour)
-
-    if not rows:
-        text = f"🕐 {hour}시대 신청 내역이 없습니다."
-    else:
-        by_slot = {}
-        for r in rows:
-            by_slot.setdefault(r["slot_time"], []).append(r)
-
-        lines = [f"🕐 {hour}시대 신청 현황\n"]
-        for m in MINUTES:
-            slot = f"{hour:02d}:{m:02d}"
-            entries = by_slot.get(slot, [])
-            checked_cnt = sum(1 for e in entries if e["checked_in"])
-            lines.append(
-                f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}건 (참여완료 {checked_cnt}건)"
-            )
-            for e in entries:
-                status = "✅" if e["checked_in"] else "⏳"
-                hc = signup_headcount(e["companions"])
-                lines.append(
-                    f"  {status} [{e['id']}] {e['group_name']} / {e['rep_name']} / "
-                    f"{e['phone']} / 동반자: {e['companions']} (총 {hc}명)"
-                )
-        lines.append("\n삭제하려면 '삭제 (번호)' 형식으로 입력해주세요. 예: 삭제 3")
-        text = "\n".join(lines)
-
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("◀ 시간 다시 선택", callback_data="admin_back")]]
-    )
-    await query.edit_message_text(text, reply_markup=keyboard)
-
-
 async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return None
@@ -894,14 +900,15 @@ async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"📋 전체 신청 명단\n총 {total_signups}건 신청 / 참여완료 {total_checked}건\n"]
     for h in HOURS:
-        for m in MINUTES:
+        for m in HOUR_MINUTES.get(h, []):
             slot = f"{h:02d}:{m:02d}"
             entries = by_slot.get(slot)
             if not entries:
                 continue
+            filled = sum(signup_headcount(e["companions"]) for e in entries)
             checked_cnt = sum(1 for e in entries if e["checked_in"])
             lines.append(
-                f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}건 (참여완료 {checked_cnt}건)"
+                f"\n▶ {slot} — {filled}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}건)"
             )
             for e in entries:
                 status = "✅" if e["checked_in"] else "⏳"
@@ -912,12 +919,51 @@ async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
     full_text = "\n".join(lines)
-
-    # 텔레그램 메시지 길이 제한(4096자)을 고려해 나눠서 전송
     CHUNK_SIZE = 3500
     for i in range(0, len(full_text), CHUNK_SIZE):
         await update.message.reply_text(full_text[i:i + CHUNK_SIZE])
     return ConversationHandler.END
+
+
+async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("관리자만 사용할 수 있어요.", show_alert=True)
+        return
+    await query.answer()
+    hour = int(query.data.split("_")[-1])
+    rows = get_signups_for_hour(hour)
+
+    if not rows:
+        text = f"🕐 {hour}시대 신청 내역이 없습니다."
+    else:
+        by_slot = {}
+        for r in rows:
+            by_slot.setdefault(r["slot_time"], []).append(r)
+
+        lines = [f"🕐 {hour}시대 신청 현황\n"]
+        for m in HOUR_MINUTES.get(hour, []):
+            slot = f"{hour:02d}:{m:02d}"
+            entries = by_slot.get(slot, [])
+            filled = sum(signup_headcount(e["companions"]) for e in entries)
+            checked_cnt = sum(1 for e in entries if e["checked_in"])
+            lines.append(
+                f"\n▶ {slot} — {filled}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}건)"
+            )
+            for e in entries:
+                status = "✅" if e["checked_in"] else "⏳"
+                hc = signup_headcount(e["companions"])
+                lines.append(
+                    f"  {status} [{e['id']}] {e['group_name']} / {e['rep_name']} / "
+                    f"{e['phone']} / 동반자: {e['companions']} (총 {hc}명)"
+                )
+        lines.append("\n삭제하려면 '삭제 (번호)' 형식으로 입력해주세요. 예: 삭제 3")
+        text = "\n".join(lines)
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("◀ 시간 다시 선택", callback_data="admin_back")]]
+    )
+    await query.edit_message_text(text, reply_markup=keyboard)
 
 
 async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -933,7 +979,7 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_delete_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        return None  # 관리자가 아니면 조용히 무시 (일반 사용자 텍스트와 우연히 겹치는 것 방지)
+        return None
 
     match = re.match(r"^삭제\s+(\d+)$", update.message.text.strip())
     if not match:
@@ -1066,16 +1112,137 @@ async def admin_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Render Web Service용 헬스체크 서버
+# Render Web Service용 헬스체크 서버 + 동반자 입력 미니앱(WebApp) 페이지
 # ---------------------------------------------------------------------------
+_WEBAPP_HTML = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>동반자 입력</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+    background: var(--tg-theme-bg-color, #ffffff);
+    color: var(--tg-theme-text-color, #222222);
+    margin: 0;
+    padding: 16px;
+  }
+  h2 { font-size: 18px; margin-bottom: 4px; }
+  p.desc { font-size: 13px; color: #888; margin-top: 0; margin-bottom: 16px; }
+  .row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .row input {
+    flex: 1;
+    padding: 10px 12px;
+    font-size: 15px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+    color: inherit;
+  }
+  .row button.remove {
+    margin-left: 8px;
+    border: none;
+    background: none;
+    color: #e74c3c;
+    font-size: 20px;
+    cursor: pointer;
+  }
+  #addBtn {
+    width: 100%;
+    padding: 10px;
+    margin-top: 4px;
+    border: 1px dashed #aaa;
+    border-radius: 8px;
+    background: none;
+    color: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  #submitBtn {
+    width: 100%;
+    padding: 14px;
+    margin-top: 20px;
+    border: none;
+    border-radius: 8px;
+    background: var(--tg-theme-button-color, #2481cc);
+    color: var(--tg-theme-button-text-color, #ffffff);
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <h2>👥 같이 갈 구역원</h2>
+  <p class="desc">한 명씩 이름을 입력해주세요. 없으면 그대로 제출하면 '없음'으로 처리돼요.</p>
+  <div id="rows"></div>
+  <button id="addBtn" type="button">➕ 동반자 추가</button>
+  <button id="submitBtn" type="button">✅ 제출</button>
+
+<script>
+  const tg = window.Telegram.WebApp;
+  tg.expand();
+
+  const rowsEl = document.getElementById('rows');
+
+  function addRow(value) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '이름 입력';
+    input.value = value || '';
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove';
+    removeBtn.type = 'button';
+    removeBtn.textContent = '✕';
+    removeBtn.onclick = () => row.remove();
+    row.appendChild(input);
+    row.appendChild(removeBtn);
+    rowsEl.appendChild(row);
+  }
+
+  addRow('');
+
+  document.getElementById('addBtn').onclick = () => addRow('');
+
+  document.getElementById('submitBtn').onclick = () => {
+    const inputs = rowsEl.querySelectorAll('input');
+    const names = Array.from(inputs)
+      .map(i => i.value.trim())
+      .filter(v => v.length > 0);
+    tg.sendData(JSON.stringify(names));
+    tg.close();
+  };
+</script>
+</body>
+</html>
+"""
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/webapp":
+            body = _WEBAPP_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # 헬스체크 요청 로그는 생략
+        pass
 
 
 def _run_health_server():
@@ -1114,7 +1281,8 @@ def main():
             ENTER_LEADER: [MessageHandler(filters.TEXT & ~filters.COMMAND, leader_entered)],
             ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_entered)],
             ENTER_COMPANIONS: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, companions_entered)
+                MessageHandler(filters.StatusUpdate.WEB_APP_DATA, companions_webapp_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, companions_entered),
             ],
             CONFIRM: [
                 CallbackQueryHandler(submit_signup, pattern=r"^submit$"),
@@ -1141,7 +1309,6 @@ def main():
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("admin", admin_command))
-    # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"/"관리자"를 보내면 반응하게 처리
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list))
@@ -1153,9 +1320,7 @@ def main():
     app.add_handler(CommandHandler("mine", my_signups_command))
     app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), my_signups_command))
     app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
-    app.add_handler(
-        CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$")
-    )
+    app.add_handler(CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_back, pattern=r"^admin_back$"))
     app.add_handler(CallbackQueryHandler(checkin_clicked, pattern=r"^checkin_\d+$"))
 
