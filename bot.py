@@ -315,6 +315,16 @@ def mark_checked_in(signup_id: int, requester_user_id: int):
         conn.close()
 
 
+def get_all_signups():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signups ORDER BY slot_time, id")
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
 def get_signups_for_hour(hour: int):
     conn = get_conn()
     try:
@@ -497,18 +507,14 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 
 def hour_keyboard(prefix: str):
     """1시~7시(19시) 선택 키보드. prefix로 신청용/관리자용 콜백 구분.
-    신청용(prefix='req_')일 때는 시간대별 잔여 신청 건수를 같이 보여준다."""
-    show_capacity = prefix == "req_"
+    신청용/관리자용 모두 시간대별 신청 건수 현황을 같이 보여준다."""
     buttons = []
     row = []
     for h in HOURS:
-        if show_capacity:
-            filled = count_hour(h)
-            label = f"{h}시({filled}/{HOUR_CAPACITY}건)"
-            if filled >= HOUR_CAPACITY:
-                label += " 마감"
-        else:
-            label = f"{h}시"
+        filled = count_hour(h)
+        label = f"{h}시({filled}/{HOUR_CAPACITY}건)"
+        if filled >= HOUR_CAPACITY:
+            label += " 마감"
         row.append(InlineKeyboardButton(label, callback_data=f"{prefix}hour_{h}"))
         if len(row) == 3:
             buttons.append(row)
@@ -622,7 +628,7 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = phone
     await update.message.reply_text(
         "같이 갈 구역원이 있다면 이름을 콤마(,)로 구분해서 입력해주세요.\n"
-        "예: 김알곡,장시몬,강천사\n"
+        "예: 김혜림,장희연,강유전\n"
         "없으면 '없음'이라고 입력해주세요."
     )
     return ENTER_COMPANIONS
@@ -869,6 +875,51 @@ async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.edit_message_text(text, reply_markup=keyboard)
 
 
+async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+    context.user_data.clear()
+
+    rows = get_all_signups()
+    if not rows:
+        await update.message.reply_text("전체 신청 내역이 없어요.")
+        return ConversationHandler.END
+
+    by_slot = {}
+    for r in rows:
+        by_slot.setdefault(r["slot_time"], []).append(r)
+
+    total_signups = len(rows)
+    total_checked = sum(1 for r in rows if r["checked_in"])
+
+    lines = [f"📋 전체 신청 명단\n총 {total_signups}건 신청 / 참여완료 {total_checked}건\n"]
+    for h in HOURS:
+        for m in MINUTES:
+            slot = f"{h:02d}:{m:02d}"
+            entries = by_slot.get(slot)
+            if not entries:
+                continue
+            checked_cnt = sum(1 for e in entries if e["checked_in"])
+            lines.append(
+                f"\n▶ {slot} — {len(entries)}/{MAX_PER_SLOT}건 (참여완료 {checked_cnt}건)"
+            )
+            for e in entries:
+                status = "✅" if e["checked_in"] else "⏳"
+                hc = signup_headcount(e["companions"])
+                lines.append(
+                    f"  {status} [{e['id']}] {e['group_name']} / {e['rep_name']} / "
+                    f"{e['phone']} / 동반자: {e['companions']} (총 {hc}명)"
+                )
+
+    full_text = "\n".join(lines)
+
+    # 텔레그램 메시지 길이 제한(4096자)을 고려해 나눠서 전송
+    CHUNK_SIZE = 3500
+    for i in range(0, len(full_text), CHUNK_SIZE):
+        await update.message.reply_text(full_text[i:i + CHUNK_SIZE])
+    return ConversationHandler.END
+
+
 async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_admin(query.from_user.id):
@@ -1078,6 +1129,7 @@ def main():
             CommandHandler("admin", admin_command),
             MessageHandler(filters.Regex(r"^명단$"), admin_command),
             MessageHandler(filters.Regex(r"^관리자$"), admin_command),
+            MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list),
             MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup),
             MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title),
             MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin),
@@ -1092,6 +1144,7 @@ def main():
     # 텔레그램은 한글 슬래시 명령어(/명단)를 지원하지 않아서, 텍스트로 "명단"/"관리자"를 보내면 반응하게 처리
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command))
     app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), admin_command))
+    app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list))
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup))
     app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title))
     app.add_handler(MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin))
