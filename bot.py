@@ -3,7 +3,7 @@
 기도회 신청 텔레그램 봇
 - 오후 5시40분~8시(17:40~19:50), 10분 단위 타임슬롯 (17시는 40/50분만, 18~19시는 정시부터)
 - 슬롯당 최대 10명 (구역장 1명 + 동반자 합산 인원 기준)
-- 회/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
+- 회/지역/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
 - 관리자는 버튼/텍스트로 타임별 명단 조회, 전체 명단, 삭제, 제목 설정, 관리자 추가/삭제
 - 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
@@ -414,11 +414,13 @@ def _load_google_credentials():
 
 def _ensure_sheet_header(ws):
     try:
+        expected = ["ID", "시간", "회/지역/구역", "구역장", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
         first_row = ws.row_values(1)
         if not first_row:
-            ws.append_row(
-                ["ID", "시간", "회/구역", "구역장", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
-            )
+            ws.append_row(expected)
+        elif len(first_row) >= 3 and first_row[2] != "회/지역/구역":
+            # 예전 헤더("회/구역" 등)가 이미 있으면 새 문구로 갱신
+            ws.update("A1", [expected])
     except Exception:
         logger.exception("구글 시트 헤더 설정 실패")
 
@@ -598,7 +600,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slot = query.data.split("_", 1)[1]
     context.user_data["slot_time"] = slot
     await query.edit_message_text(
-        f"선택하신 타임: {slot}\n\n회/구역명을 입력해주세요."
+        f"선택하신 타임: {slot}\n\n회/지역/구역명을 입력해주세요."
     )
     return ENTER_GROUP
 
@@ -606,7 +608,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_name = update.message.text.strip()
     if not group_name:
-        await update.message.reply_text("회/구역명을 입력해주세요.")
+        await update.message.reply_text("회/지역/구역명을 입력해주세요.")
         return ENTER_GROUP
     context.user_data["group_name"] = group_name
     await update.message.reply_text("구역장 이름을 입력해주세요.")
@@ -642,11 +644,14 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "없으면 '없음'이라고 입력해주세요."
     )
     if WEBAPP_BASE_URL:
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton(
+        # 텔레그램 정책상 팝업에서 봇으로 데이터(sendData)를 보내려면
+        # 인라인 버튼이 아니라 하단 고정 키보드 버튼으로 열어야 함
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton(
                 "📝 동반자 입력하기",
                 web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp"),
-            )]]
+            )]],
+            resize_keyboard=True,
         )
         await update.message.reply_text(text, reply_markup=keyboard)
     else:
@@ -685,7 +690,7 @@ async def _finalize_companions(message, context, companions: str):
     summary = (
         "📋 신청 내용을 확인해주세요.\n\n"
         f"⏰ 시간: {slot}\n"
-        f"🏠 회/구역: {group_name}\n"
+        f"🏠 회/지역/구역: {group_name}\n"
         f"👤 구역장: {name}\n"
         f"📞 연락처: {phone}\n"
         f"👥 같이 가는 사람: {companions} (총 {headcount}명)\n\n"
@@ -747,6 +752,11 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "😥 죄송해요, 방금 사이에 정원이 다 찼어요.\n"
             "'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="메인 메뉴로 돌아왔어요.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
     else:
         headcount = signup_headcount(companions)
         await asyncio.to_thread(
@@ -763,6 +773,11 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "신청해주셔서 감사합니다 🙏\n\n"
             "기도회에 실제로 참여하신 후 아래 버튼을 눌러주세요.",
             reply_markup=checkin_keyboard,
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="메인 메뉴로 돌아왔어요.",
+            reply_markup=MAIN_MENU_KEYBOARD,
         )
     context.user_data.clear()
     return ConversationHandler.END
@@ -802,6 +817,11 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("신청이 취소되었습니다. 다시 하시려면 '신청시작' 버튼을 눌러주세요.")
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="메인 메뉴로 돌아왔어요.",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
@@ -831,7 +851,7 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         headcount = signup_headcount(r["companions"])
         text = (
             f"⏰ {r['slot_time']}\n"
-            f"🏠 회/구역: {r['group_name']}\n"
+            f"🏠 회/지역/구역: {r['group_name']}\n"
             f"👤 구역장: {r['rep_name']}\n"
             f"📞 연락처: {r['phone']}\n"
             f"👥 동반자: {r['companions']} (총 {headcount}명)\n"
