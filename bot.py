@@ -1622,6 +1622,8 @@ def main():
     # 아래 명령어들은 그룹 -1(더 높은 우선순위)로 등록해서, 신청 도중 어떤 단계에
     # 있든 이 명령어들이 항상 먼저 인식되도록 함 (신청 흐름에 삼켜지는 것 방지)
     app.add_handler(CommandHandler("admin", admin_command), group=-1)
+    app.add_handler(CommandHandler("cancel", cancel_command), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^취소$"), cancel_command), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), admin_command), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list), group=-1)
