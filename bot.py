@@ -751,6 +751,11 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "😥 죄송해요, 방금 사이에 정원이 다 찼어요.\n"
             "'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="👇 아래 메뉴에서 다시 시도해주세요.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
     else:
         headcount = signup_headcount(companions)
         await asyncio.to_thread(
@@ -767,6 +772,11 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "신청해주셔서 감사합니다 🙏\n\n"
             "기도회에 실제로 참여하신 후 아래 버튼을 눌러주세요.",
             reply_markup=checkin_keyboard,
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="👇 다른 신청을 하시거나 내 신청을 확인하려면 아래 메뉴를 이용해주세요.",
+            reply_markup=MAIN_MENU_KEYBOARD,
         )
     context.user_data.clear()
     return ConversationHandler.END
@@ -806,6 +816,11 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("신청이 취소되었습니다. 다시 하시려면 '신청시작' 버튼을 눌러주세요.")
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="👇 아래 메뉴를 이용해주세요.",
+        reply_markup=MAIN_MENU_KEYBOARD,
+    )
     context.user_data.clear()
     return ConversationHandler.END
 
