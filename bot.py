@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 기도회 신청 텔레그램 봇
-- 오후 5시40분~8시(17:40~19:50), 10분 단위 타임슬롯 (17시는 40/50분만, 18~19시는 정시부터)
+- 오후 5시~8시(17:00~19:50), 10분 단위 타임슬롯
 - 슬롯당 최대 10명 (구역장 1명 + 동반자 합산 인원 기준)
 - 회/팀/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
@@ -84,10 +84,9 @@ WEBAPP_BASE_URL = (
 
 MAX_PER_SLOT = 10  # 10분 슬롯당 최대 "인원" (구역장 + 동반자 합산)
 
-# 운영 시간: 17:40 ~ 19:50
-# 17시는 40분/50분만, 18시/19시는 정시부터 10분 단위 전체
+# 운영 시간: 17:00 ~ 19:50, 10분 단위 전체
 HOUR_MINUTES = {
-    17: [40, 50],
+    17: [0, 10, 20, 30, 40, 50],
     18: [0, 10, 20, 30, 40, 50],
     19: [0, 10, 20, 30, 40, 50],
 }
@@ -561,7 +560,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MAIN_MENU_KEYBOARD,
     )
     await update.message.reply_text(
-        "오후 5시40분 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
+        "오후 5시 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
         f"타임당 최대 {MAX_PER_SLOT}명(구역장+동반자 합산)까지 신청 가능합니다.\n\n"
         "아래에서 원하시는 시간대를 선택해주세요.",
         reply_markup=hour_keyboard(prefix="req_"),
@@ -752,11 +751,6 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "😥 죄송해요, 방금 사이에 정원이 다 찼어요.\n"
             "'신청시작' 버튼으로 다른 타임을 선택해주세요."
         )
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="메인 메뉴로 돌아왔어요.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
     else:
         headcount = signup_headcount(companions)
         await asyncio.to_thread(
@@ -773,11 +767,6 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "신청해주셔서 감사합니다 🙏\n\n"
             "기도회에 실제로 참여하신 후 아래 버튼을 눌러주세요.",
             reply_markup=checkin_keyboard,
-        )
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="메인 메뉴로 돌아왔어요.",
-            reply_markup=MAIN_MENU_KEYBOARD,
         )
     context.user_data.clear()
     return ConversationHandler.END
@@ -817,11 +806,6 @@ async def cancel_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text("신청이 취소되었습니다. 다시 하시려면 '신청시작' 버튼을 눌러주세요.")
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="메인 메뉴로 돌아왔어요.",
-        reply_markup=MAIN_MENU_KEYBOARD,
-    )
     context.user_data.clear()
     return ConversationHandler.END
 
