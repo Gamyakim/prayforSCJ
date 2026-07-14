@@ -34,6 +34,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
@@ -1620,20 +1621,32 @@ def main():
     app.add_handler(conv_handler)
 
     # 아래 명령어들은 그룹 -1(더 높은 우선순위)로 등록해서, 신청 도중 어떤 단계에
-    # 있든 이 명령어들이 항상 먼저 인식되도록 함 (신청 흐름에 삼켜지는 것 방지)
-    app.add_handler(CommandHandler("admin", admin_command), group=-1)
-    app.add_handler(CommandHandler("cancel", cancel_command), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^취소$"), cancel_command), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^명단$"), admin_command), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), admin_command), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), admin_remove_admin), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^관리자목록$"), admin_list_admins), group=-1)
-    app.add_handler(CommandHandler("mine", my_signups_command), group=-1)
-    app.add_handler(MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), my_signups_command), group=-1)
+    # 있든 이 명령어들이 항상 먼저 인식되도록 함 (신청 흐름에 삼켜지는 것 방지).
+    # 처리 후에는 ApplicationHandlerStop을 발생시켜, 같은 메시지가 conv_handler(그룹 0)에서
+    # 또다시 처리되어 이중 실행되는 것을 막는다.
+    def _stop_after(func):
+        async def wrapper(update, context):
+            await func(update, context)
+            raise ApplicationHandlerStop
+
+        return wrapper
+
+    app.add_handler(CommandHandler("admin", _stop_after(admin_command)), group=-1)
+    app.add_handler(CommandHandler("cancel", _stop_after(cancel_command)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^취소$"), _stop_after(cancel_command)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^명단$"), _stop_after(admin_command)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), _stop_after(admin_command)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), _stop_after(admin_full_list)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), _stop_after(admin_delete_signup)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), _stop_after(admin_set_title)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), _stop_after(admin_add_admin)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), _stop_after(admin_remove_admin)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^관리자목록$"), _stop_after(admin_list_admins)), group=-1)
+    app.add_handler(CommandHandler("mine", _stop_after(my_signups_command)), group=-1)
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^내\s*신청(\s*확인)?$"), _stop_after(my_signups_command)),
+        group=-1,
+    )
     app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_back, pattern=r"^admin_back$"))
