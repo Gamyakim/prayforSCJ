@@ -3,7 +3,7 @@
 기도회 신청 텔레그램 봇
 - 오후 5시~8시(17:00~19:50), 10분 단위 타임슬롯
 - 슬롯당 최대 10명 (인솔자 1명 + 동반자 합산 인원 기준)
-- 회/팀/구역명 / 인솔자 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
+- 회/지역/팀/구역명 / 인솔자 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
 - 관리자는 버튼/텍스트로 타임별 명단 조회, 전체 명단, 삭제, 제목 설정, 관리자 추가/삭제
 - 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
@@ -414,11 +414,11 @@ def _load_google_credentials():
 
 def _ensure_sheet_header(ws):
     try:
-        expected = ["ID", "시간", "회/팀/구역", "인솔자", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
+        expected = ["ID", "시간", "회/지역/팀/구역", "인솔자", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
         first_row = ws.row_values(1)
         if not first_row:
             ws.append_row(expected)
-        elif len(first_row) >= 3 and first_row[2] != "회/팀/구역":
+        elif len(first_row) >= 3 and first_row[2] != "회/지역/팀/구역":
             # 예전 헤더("회/구역" 등)가 이미 있으면 새 문구로 갱신
             ws.update("A1", [expected])
     except Exception:
@@ -602,9 +602,9 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"선택하신 타임: {slot}")
 
     text = (
-        "아래 버튼을 눌러 팝업창에서 회/팀/구역, 인솔자 이름, 연락처, 동반자를 "
+        "아래 버튼을 눌러 팝업창에서 회/지역/팀/구역, 인솔자 이름, 연락처, 동반자를 "
         "한 번에 입력하시거나,\n"
-        "그냥 회/팀/구역명을 텍스트로 바로 입력하셔도 돼요."
+        "그냥 회/지역/팀/구역명을 텍스트로 바로 입력하셔도 돼요."
     )
     if WEBAPP_BASE_URL:
         keyboard = ReplyKeyboardMarkup(
@@ -620,7 +620,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="회/팀/구역명을 입력해주세요.",
+            text="회/지역/팀/구역명을 입력해주세요.",
         )
     return ENTER_GROUP
 
@@ -628,7 +628,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_name = update.message.text.strip()
     if not group_name:
-        await update.message.reply_text("회/팀/구역명을 입력해주세요.")
+        await update.message.reply_text("회/지역/팀/구역명을 입력해주세요.")
         return ENTER_GROUP
     context.user_data["group_name"] = group_name
     await update.message.reply_text("인솔자 이름을 입력해주세요.")
@@ -636,7 +636,7 @@ async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """통합 팝업 폼(회/팀/구역+인솔자+연락처+동반자)에서 한 번에 제출된 데이터 처리."""
+    """통합 팝업 폼(회/지역/팀/구역+인솔자+연락처+동반자)에서 한 번에 제출된 데이터 처리."""
     raw = update.effective_message.web_app_data.data
     try:
         data = json.loads(raw)
@@ -656,7 +656,7 @@ async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not group_name:
         await update.effective_message.reply_text(
-            "회/팀/구역명이 비어있어요. 버튼을 다시 눌러 입력해주세요."
+            "회/지역/팀/구역명이 비어있어요. 버튼을 다시 눌러 입력해주세요."
         )
         return ENTER_GROUP
     if not rep_name:
@@ -752,7 +752,7 @@ async def _finalize_companions(message, context, companions: str):
     summary = (
         "📋 신청 내용을 확인해주세요.\n\n"
         f"⏰ 시간: {slot}\n"
-        f"🏠 회/팀/구역: {group_name}\n"
+        f"🏠 회/지역/팀/구역: {group_name}\n"
         f"👤 인솔자: {name}\n"
         f"📞 연락처: {phone}\n"
         f"👥 같이 가는 사람: {companions} (총 {headcount}명)\n\n"
@@ -913,7 +913,7 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         headcount = signup_headcount(r["companions"])
         text = (
             f"⏰ {r['slot_time']}\n"
-            f"🏠 회/팀/구역: {r['group_name']}\n"
+            f"🏠 회/지역/팀/구역: {r['group_name']}\n"
             f"👤 인솔자: {r['rep_name']}\n"
             f"📞 연락처: {r['phone']}\n"
             f"👥 동반자: {r['companions']} (총 {headcount}명)\n"
@@ -1436,6 +1436,9 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
   <label for="hoeName">회</label>
   <input type="text" id="hoeName" placeholder="예: 자장부청" />
 
+  <label for="areaName">지역</label>
+  <input type="text" id="areaName" placeholder="예: 강남지역" />
+
   <label for="teamName">팀</label>
   <input type="text" id="teamName" placeholder="예: 3팀" />
 
@@ -1491,6 +1494,7 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
 
   document.getElementById('submitBtn').onclick = () => {
     const hoe = document.getElementById('hoeName').value.trim();
+    const area = document.getElementById('areaName').value.trim();
     const team = document.getElementById('teamName').value.trim();
     const district = document.getElementById('districtName').value.trim();
     const repName = document.getElementById('repName').value.trim();
@@ -1503,8 +1507,8 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
       .map(i => i.value.trim())
       .filter(v => v.length > 0);
 
-    if (!hoe || !team || !district) {
-      errorEl.textContent = '회, 팀, 구역을 모두 입력해주세요.';
+    if (!hoe || !area || !team || !district) {
+      errorEl.textContent = '회, 지역, 팀, 구역을 모두 입력해주세요.';
       return;
     }
     if (!repName) {
@@ -1518,7 +1522,7 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
     errorEl.textContent = '';
 
     tg.sendData(JSON.stringify({
-      group_name: hoe + ' ' + team + ' ' + district,
+      group_name: hoe + ' ' + area + ' ' + team + ' ' + district,
       rep_name: repName,
       phone: phone,
       companions: companions,
