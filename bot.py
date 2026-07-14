@@ -2,8 +2,8 @@
 """
 기도회 신청 텔레그램 봇
 - 오후 5시~8시(17:00~19:50), 10분 단위 타임슬롯
-- 슬롯당 최대 10명 (구역장 1명 + 동반자 합산 인원 기준)
-- 회/팀/구역명 / 구역장 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
+- 슬롯당 최대 10명 (인솔자 1명 + 동반자 합산 인원 기준)
+- 회/팀/구역명 / 인솔자 이름 / 연락처(010-XXXX-XXXX 검증) / 동반자(콤마 구분) 입력
 - 참여완료 체크 (본인만)
 - 관리자는 버튼/텍스트로 타임별 명단 조회, 전체 명단, 삭제, 제목 설정, 관리자 추가/삭제
 - 데이터 저장: PostgreSQL (Render 재배포에도 데이터 유지)
@@ -82,7 +82,7 @@ WEBAPP_BASE_URL = (
     or os.environ.get("WEBAPP_BASE_URL", "").rstrip("/")
 )
 
-MAX_PER_SLOT = 10  # 10분 슬롯당 최대 "인원" (구역장 + 동반자 합산)
+MAX_PER_SLOT = 10  # 10분 슬롯당 최대 "인원" (인솔자 + 동반자 합산)
 
 # 운영 시간: 17:00 ~ 19:50, 10분 단위 전체
 HOUR_MINUTES = {
@@ -243,7 +243,7 @@ def signup_headcount(companions: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 슬롯 정원 = 인원수(구역장+동반자) 기준 (10명)
+# 슬롯 정원 = 인원수(인솔자+동반자) 기준 (10명)
 # ---------------------------------------------------------------------------
 def get_slot_headcount(slot_time: str) -> int:
     conn = get_conn()
@@ -413,7 +413,7 @@ def _load_google_credentials():
 
 def _ensure_sheet_header(ws):
     try:
-        expected = ["ID", "시간", "회/팀/구역", "구역장", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
+        expected = ["ID", "시간", "회/팀/구역", "인솔자", "연락처", "동반자", "인원수", "참여여부", "신청일시"]
         first_row = ws.row_values(1)
         if not first_row:
             ws.append_row(expected)
@@ -561,7 +561,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(
         "오후 5시 ~ 8시, 10분 단위로 신청하실 수 있어요.\n"
-        f"타임당 최대 {MAX_PER_SLOT}명(구역장+동반자 합산)까지 신청 가능합니다.\n\n"
+        f"타임당 최대 {MAX_PER_SLOT}명(인솔자+동반자 합산)까지 신청 가능합니다.\n\n"
         "아래에서 원하시는 시간대를 선택해주세요.",
         reply_markup=hour_keyboard(prefix="req_"),
     )
@@ -601,7 +601,7 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(f"선택하신 타임: {slot}")
 
     text = (
-        "아래 버튼을 눌러 팝업창에서 회/팀/구역, 구역장 이름, 연락처, 동반자를 "
+        "아래 버튼을 눌러 팝업창에서 회/팀/구역, 인솔자 이름, 연락처, 동반자를 "
         "한 번에 입력하시거나,\n"
         "그냥 회/팀/구역명을 텍스트로 바로 입력하셔도 돼요."
     )
@@ -630,12 +630,12 @@ async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("회/팀/구역명을 입력해주세요.")
         return ENTER_GROUP
     context.user_data["group_name"] = group_name
-    await update.message.reply_text("구역장 이름을 입력해주세요.")
+    await update.message.reply_text("인솔자 이름을 입력해주세요.")
     return ENTER_LEADER
 
 
 async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """통합 팝업 폼(회/팀/구역+구역장+연락처+동반자)에서 한 번에 제출된 데이터 처리."""
+    """통합 팝업 폼(회/팀/구역+인솔자+연락처+동반자)에서 한 번에 제출된 데이터 처리."""
     raw = update.effective_message.web_app_data.data
     try:
         data = json.loads(raw)
@@ -660,7 +660,7 @@ async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYP
         return ENTER_GROUP
     if not rep_name:
         await update.effective_message.reply_text(
-            "구역장 이름이 비어있어요. 버튼을 다시 눌러 입력해주세요."
+            "인솔자 이름이 비어있어요. 버튼을 다시 눌러 입력해주세요."
         )
         return ENTER_GROUP
     if not PHONE_PATTERN.match(phone):
@@ -679,7 +679,7 @@ async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYP
 async def leader_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("구역장 이름을 입력해주세요.")
+        await update.message.reply_text("인솔자 이름을 입력해주세요.")
         return ENTER_LEADER
     context.user_data["rep_name"] = name
     await update.message.reply_text(
@@ -726,7 +726,7 @@ async def _finalize_companions(message, context, companions: str):
 
     if headcount > MAX_PER_SLOT:
         await message.reply_text(
-            f"한 타임 최대 인원은 {MAX_PER_SLOT}명이에요 (구역장 포함). "
+            f"한 타임 최대 인원은 {MAX_PER_SLOT}명이에요 (인솔자 포함). "
             f"입력하신 인원은 총 {headcount}명이라 넘어가요.\n"
             "동반자 수를 줄여서 다시 입력해주세요."
         )
@@ -752,7 +752,7 @@ async def _finalize_companions(message, context, companions: str):
         "📋 신청 내용을 확인해주세요.\n\n"
         f"⏰ 시간: {slot}\n"
         f"🏠 회/팀/구역: {group_name}\n"
-        f"👤 구역장: {name}\n"
+        f"👤 인솔자: {name}\n"
         f"📞 연락처: {phone}\n"
         f"👥 같이 가는 사람: {companions} (총 {headcount}명)\n\n"
         "제출하시겠어요?"
@@ -913,7 +913,7 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text = (
             f"⏰ {r['slot_time']}\n"
             f"🏠 회/팀/구역: {r['group_name']}\n"
-            f"👤 구역장: {r['rep_name']}\n"
+            f"👤 인솔자: {r['rep_name']}\n"
             f"📞 연락처: {r['phone']}\n"
             f"👥 동반자: {r['companions']} (총 {headcount}명)\n"
             f"상태: {status}"
@@ -1441,7 +1441,7 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
   <label for="districtName">구역</label>
   <input type="text" id="districtName" placeholder="예: 5구역" />
 
-  <label for="repName">구역장 이름</label>
+  <label for="repName">인솔자 이름</label>
   <input type="text" id="repName" placeholder="이름 입력" />
 
   <label for="phone1">연락처</label>
@@ -1507,7 +1507,7 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
       return;
     }
     if (!repName) {
-      errorEl.textContent = '구역장 이름을 입력해주세요.';
+      errorEl.textContent = '인솔자 이름을 입력해주세요.';
       return;
     }
     if (!phonePattern.test(phone)) {
