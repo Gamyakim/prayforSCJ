@@ -555,7 +555,23 @@ def slot_keyboard_for_hour(hour: int):
 # 신청 흐름 핸들러
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     title = get_setting("event_title", DEFAULT_EVENT_TITLE)
+
+    if not is_admin(user.id):
+        existing = get_signups_for_user(user.id)
+        if existing:
+            slot_list = ", ".join(r["slot_time"] for r in existing)
+            await update.message.reply_text(
+                f"🙏{title}\n\n"
+                f"이미 신청하신 내역이 있어요 ({slot_list}).\n"
+                "한 분당 신청은 1건만 가능해요.\n\n"
+                "다른 시간으로 다시 신청하시려면, '내 신청 확인'에서 "
+                "기존 신청을 먼저 취소해주세요.",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+            return ConversationHandler.END
+
     await update.message.reply_text(
         f"🙏{title} 신청 봇입니다.\n\n아래 메뉴 버튼을 이용해주세요.",
         reply_markup=MAIN_MENU_KEYBOARD,
@@ -802,6 +818,16 @@ async def submit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "[제출 시도] user_id=%s username=%s slot=%s group=%s name=%s companions=%s",
         user.id, user.username, slot, group_name, name, companions,
     )
+
+    if not is_admin(user.id):
+        existing = get_signups_for_user(user.id)
+        if existing:
+            await query.edit_message_text(
+                "😥 이미 신청하신 내역이 있어서 추가 신청이 안 돼요.\n"
+                "'내 신청 확인'에서 기존 신청을 먼저 취소해주세요."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
 
     signup_id = insert_signup(
         slot, group_name, name, phone, companions, user.id, user.username or ""
