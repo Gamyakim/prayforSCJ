@@ -951,26 +951,10 @@ async def user_cancel_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ---------------------------------------------------------------------------
 # 관리자 핸들러
 # ---------------------------------------------------------------------------
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("관리자만 사용할 수 있어요.")
-        return ConversationHandler.END
-    context.user_data.clear()
-    await update.message.reply_text(
-        "확인하실 시간대를 선택해주세요.", reply_markup=hour_keyboard(prefix="admin_")
-    )
-    return ConversationHandler.END
-
-
-async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return None
-    context.user_data.clear()
-
+def _build_full_list_text() -> str:
     rows = get_all_signups()
     if not rows:
-        await update.message.reply_text("전체 신청 내역이 없어요.")
-        return ConversationHandler.END
+        return "전체 신청 내역이 없어요."
 
     by_slot = {}
     for r in rows:
@@ -998,8 +982,80 @@ async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"  {status} [{e['id']}] {e['group_name']} / {e['rep_name']} / "
                     f"{e['phone']} / 동반자: {e['companions']} (총 {hc}명)"
                 )
+    return "\n".join(lines)
 
-    full_text = "\n".join(lines)
+
+def _build_admin_status_text() -> str:
+    env_ids = sorted(ADMIN_IDS)
+    db_ids = sorted(get_db_admin_ids())
+    lines = ["👑 관리자 현황\n"]
+    if env_ids:
+        lines.append("[환경변수 등록 - 봇에서 삭제 불가]")
+        lines.extend(f"  · {uid}" for uid in env_ids)
+    if db_ids:
+        lines.append("\n[봇에서 추가된 관리자]")
+        lines.extend(f"  · {uid}" for uid in db_ids)
+    if not env_ids and not db_ids:
+        lines.append("등록된 관리자가 없어요.")
+    lines.append(
+        "\n추가: '관리자추가 (숫자ID)' / 삭제: '관리자삭제 (숫자ID)'"
+    )
+    return "\n".join(lines)
+
+
+def _admin_menu_keyboard():
+    kb = hour_keyboard(prefix="admin_")
+    rows = list(kb.inline_keyboard)
+    rows.append(
+        [
+            InlineKeyboardButton("📋 전체명단", callback_data="admin_fulllist"),
+            InlineKeyboardButton("👑 관리자현황", callback_data="admin_status"),
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("관리자만 사용할 수 있어요.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text(
+        "확인하실 항목을 선택해주세요.", reply_markup=_admin_menu_keyboard()
+    )
+    return ConversationHandler.END
+
+
+async def admin_fulllist_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("관리자만 사용할 수 있어요.", show_alert=True)
+        return
+    await query.answer()
+    full_text = _build_full_list_text()
+    CHUNK_SIZE = 3500
+    for i in range(0, len(full_text), CHUNK_SIZE):
+        await context.bot.send_message(
+            chat_id=query.message.chat_id, text=full_text[i:i + CHUNK_SIZE]
+        )
+
+
+async def admin_status_clicked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("관리자만 사용할 수 있어요.", show_alert=True)
+        return
+    await query.answer()
+    await context.bot.send_message(
+        chat_id=query.message.chat_id, text=_build_admin_status_text()
+    )
+
+
+async def admin_full_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+    context.user_data.clear()
+    full_text = _build_full_list_text()
     CHUNK_SIZE = 3500
     for i in range(0, len(full_text), CHUNK_SIZE):
         await update.message.reply_text(full_text[i:i + CHUNK_SIZE])
@@ -1054,7 +1110,7 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     await query.edit_message_text(
-        "확인하실 시간대를 선택해주세요.", reply_markup=hour_keyboard(prefix="admin_")
+        "확인하실 항목을 선택해주세요.", reply_markup=_admin_menu_keyboard()
     )
 
 
@@ -1174,21 +1230,7 @@ async def admin_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return None
     context.user_data.clear()
-    env_ids = sorted(ADMIN_IDS)
-    db_ids = sorted(get_db_admin_ids())
-    lines = ["👑 관리자 목록\n"]
-    if env_ids:
-        lines.append("[환경변수 등록 - 봇에서 삭제 불가]")
-        lines.extend(f"  · {uid}" for uid in env_ids)
-    if db_ids:
-        lines.append("\n[봇에서 추가된 관리자]")
-        lines.extend(f"  · {uid}" for uid in db_ids)
-    if not env_ids and not db_ids:
-        lines.append("등록된 관리자가 없어요.")
-    lines.append(
-        "\n추가: '관리자추가 (숫자ID)' / 삭제: '관리자삭제 (숫자ID)'"
-    )
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(_build_admin_status_text())
     return ConversationHandler.END
 
 
@@ -1391,7 +1433,7 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
   <h2>📝 신청 정보 입력</h2>
 
   <label for="hoeName">회</label>
-  <input type="text" id="hoeName" placeholder="예: 1회" />
+  <input type="text" id="hoeName" placeholder="예: 자장부청" />
 
   <label for="teamName">팀</label>
   <input type="text" id="teamName" placeholder="예: 3팀" />
@@ -1402,8 +1444,14 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
   <label for="repName">구역장 이름</label>
   <input type="text" id="repName" placeholder="이름 입력" />
 
-  <label for="phone">연락처</label>
-  <input type="tel" id="phone" placeholder="010-1234-5678" />
+  <label for="phone1">연락처</label>
+  <div style="display:flex; align-items:center; gap:6px;">
+    <input type="tel" inputmode="numeric" pattern="[0-9]*" id="phone1" maxlength="3" placeholder="010" style="text-align:center;" />
+    <span>-</span>
+    <input type="tel" inputmode="numeric" pattern="[0-9]*" id="phone2" maxlength="4" placeholder="0000" style="text-align:center;" />
+    <span>-</span>
+    <input type="tel" inputmode="numeric" pattern="[0-9]*" id="phone3" maxlength="4" placeholder="0000" style="text-align:center;" />
+  </div>
 
   <label>같이 갈 구역원 (없으면 비워두세요)</label>
   <div id="rows"></div>
@@ -1445,7 +1493,10 @@ _FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
     const team = document.getElementById('teamName').value.trim();
     const district = document.getElementById('districtName').value.trim();
     const repName = document.getElementById('repName').value.trim();
-    const phone = document.getElementById('phone').value.trim();
+    const phone1 = document.getElementById('phone1').value.trim();
+    const phone2 = document.getElementById('phone2').value.trim();
+    const phone3 = document.getElementById('phone3').value.trim();
+    const phone = phone1 + '-' + phone2 + '-' + phone3;
     const inputs = rowsEl.querySelectorAll('input');
     const companions = Array.from(inputs)
       .map(i => i.value.trim())
@@ -1584,6 +1635,8 @@ def main():
     app.add_handler(CallbackQueryHandler(user_cancel_clicked, pattern=r"^usercancel_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_hour_selected, pattern=r"^admin_hour_\d+$"))
     app.add_handler(CallbackQueryHandler(admin_back, pattern=r"^admin_back$"))
+    app.add_handler(CallbackQueryHandler(admin_fulllist_clicked, pattern=r"^admin_fulllist$"))
+    app.add_handler(CallbackQueryHandler(admin_status_clicked, pattern=r"^admin_status$"))
     app.add_handler(CallbackQueryHandler(checkin_clicked, pattern=r"^checkin_\d+$"))
 
     logger.info("봇 시작...")
