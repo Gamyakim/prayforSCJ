@@ -598,9 +598,29 @@ async def slot_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     slot = query.data.split("_", 1)[1]
     context.user_data["slot_time"] = slot
-    await query.edit_message_text(
-        f"선택하신 타임: {slot}\n\n회/팀/구역명을 입력해주세요."
+    await query.edit_message_text(f"선택하신 타임: {slot}")
+
+    text = (
+        "아래 버튼을 눌러 팝업창에서 회/팀/구역, 구역장 이름, 연락처, 동반자를 "
+        "한 번에 입력하시거나,\n"
+        "그냥 회/팀/구역명을 텍스트로 바로 입력하셔도 돼요."
     )
+    if WEBAPP_BASE_URL:
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton(
+                "📝 신청 정보 입력하기",
+                web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp"),
+            )]],
+            resize_keyboard=True,
+        )
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, text=text, reply_markup=keyboard
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="회/팀/구역명을 입력해주세요.",
+        )
     return ENTER_GROUP
 
 
@@ -612,6 +632,48 @@ async def group_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["group_name"] = group_name
     await update.message.reply_text("구역장 이름을 입력해주세요.")
     return ENTER_LEADER
+
+
+async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """통합 팝업 폼(회/팀/구역+구역장+연락처+동반자)에서 한 번에 제출된 데이터 처리."""
+    raw = update.effective_message.web_app_data.data
+    try:
+        data = json.loads(raw)
+    except Exception:
+        logger.exception("통합 폼 데이터 파싱 실패: %s", raw)
+        await update.effective_message.reply_text(
+            "입력값을 처리하지 못했어요. 버튼을 다시 눌러 시도해주세요."
+        )
+        return ENTER_GROUP
+
+    group_name = (data.get("group_name") or "").strip()
+    rep_name = (data.get("rep_name") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    companions_list = data.get("companions") or []
+    companions_list = [c.strip() for c in companions_list if isinstance(c, str) and c.strip()]
+    companions = ",".join(companions_list) if companions_list else "없음"
+
+    if not group_name:
+        await update.effective_message.reply_text(
+            "회/팀/구역명이 비어있어요. 버튼을 다시 눌러 입력해주세요."
+        )
+        return ENTER_GROUP
+    if not rep_name:
+        await update.effective_message.reply_text(
+            "구역장 이름이 비어있어요. 버튼을 다시 눌러 입력해주세요."
+        )
+        return ENTER_GROUP
+    if not PHONE_PATTERN.match(phone):
+        await update.effective_message.reply_text(
+            "연락처 형식이 올바르지 않아요 (예: 010-1234-5678). 버튼을 다시 눌러 입력해주세요."
+        )
+        return ENTER_GROUP
+
+    context.user_data["group_name"] = group_name
+    context.user_data["rep_name"] = rep_name
+    context.user_data["phone"] = phone
+
+    return await _finalize_companions(update.effective_message, context, companions)
 
 
 async def leader_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -648,7 +710,7 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = ReplyKeyboardMarkup(
             [[KeyboardButton(
                 "📝 동반자 입력하기",
-                web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp"),
+                web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp/companions"),
             )]],
             resize_keyboard=True,
         )
@@ -1131,9 +1193,9 @@ async def admin_list_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Render Web Service용 헬스체크 서버 + 동반자 입력 미니앱(WebApp) 페이지
+# Render Web Service용 헬스체크 서버 + 신청 정보 입력 미니앱(WebApp) 페이지
 # ---------------------------------------------------------------------------
-_WEBAPP_HTML = """<!DOCTYPE html>
+_COMPANIONS_WEBAPP_HTML = """<!DOCTYPE html>
 <html lang="ko">
 <head>
 <meta charset="UTF-8" />
@@ -1245,20 +1307,195 @@ _WEBAPP_HTML = """<!DOCTYPE html>
 """
 
 
+_FULL_FORM_WEBAPP_HTML = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>신청 정보 입력</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif;
+    background: var(--tg-theme-bg-color, #ffffff);
+    color: var(--tg-theme-text-color, #222222);
+    margin: 0;
+    padding: 16px;
+  }
+  h2 { font-size: 18px; margin-bottom: 16px; }
+  label {
+    display: block;
+    font-size: 13px;
+    color: #888;
+    margin-bottom: 4px;
+    margin-top: 16px;
+  }
+  input[type="text"], input[type="tel"] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    font-size: 15px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+    color: inherit;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  .row input {
+    flex: 1;
+  }
+  .row button.remove {
+    margin-left: 8px;
+    border: none;
+    background: none;
+    color: #e74c3c;
+    font-size: 20px;
+    cursor: pointer;
+  }
+  #addBtn {
+    width: 100%;
+    padding: 10px;
+    margin-top: 4px;
+    border: 1px dashed #aaa;
+    border-radius: 8px;
+    background: none;
+    color: inherit;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  #errorMsg {
+    color: #e74c3c;
+    font-size: 13px;
+    margin-top: 12px;
+    min-height: 16px;
+  }
+  #submitBtn {
+    width: 100%;
+    padding: 14px;
+    margin-top: 12px;
+    border: none;
+    border-radius: 8px;
+    background: var(--tg-theme-button-color, #2481cc);
+    color: var(--tg-theme-button-text-color, #ffffff);
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <h2>📝 신청 정보 입력</h2>
+
+  <label for="hoeName">회</label>
+  <input type="text" id="hoeName" placeholder="예: 1회" />
+
+  <label for="teamName">팀</label>
+  <input type="text" id="teamName" placeholder="예: 3팀" />
+
+  <label for="districtName">구역</label>
+  <input type="text" id="districtName" placeholder="예: 5구역" />
+
+  <label for="repName">구역장 이름</label>
+  <input type="text" id="repName" placeholder="이름 입력" />
+
+  <label for="phone">연락처</label>
+  <input type="tel" id="phone" placeholder="010-1234-5678" />
+
+  <label>같이 갈 구역원 (없으면 비워두세요)</label>
+  <div id="rows"></div>
+  <button id="addBtn" type="button">➕ 동반자 추가</button>
+
+  <div id="errorMsg"></div>
+  <button id="submitBtn" type="button">✅ 제출</button>
+
+<script>
+  const tg = window.Telegram.WebApp;
+  tg.expand();
+
+  const rowsEl = document.getElementById('rows');
+  const errorEl = document.getElementById('errorMsg');
+
+  function addRow(value) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = '동반자 이름';
+    input.value = value || '';
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove';
+    removeBtn.type = 'button';
+    removeBtn.textContent = '✕';
+    removeBtn.onclick = () => row.remove();
+    row.appendChild(input);
+    row.appendChild(removeBtn);
+    rowsEl.appendChild(row);
+  }
+
+  document.getElementById('addBtn').onclick = () => addRow('');
+
+  const phonePattern = /^01[016789]-\\d{3,4}-\\d{4}$/;
+
+  document.getElementById('submitBtn').onclick = () => {
+    const hoe = document.getElementById('hoeName').value.trim();
+    const team = document.getElementById('teamName').value.trim();
+    const district = document.getElementById('districtName').value.trim();
+    const repName = document.getElementById('repName').value.trim();
+    const phone = document.getElementById('phone').value.trim();
+    const inputs = rowsEl.querySelectorAll('input');
+    const companions = Array.from(inputs)
+      .map(i => i.value.trim())
+      .filter(v => v.length > 0);
+
+    if (!hoe || !team || !district) {
+      errorEl.textContent = '회, 팀, 구역을 모두 입력해주세요.';
+      return;
+    }
+    if (!repName) {
+      errorEl.textContent = '구역장 이름을 입력해주세요.';
+      return;
+    }
+    if (!phonePattern.test(phone)) {
+      errorEl.textContent = '연락처 형식이 올바르지 않아요. 예: 010-1234-5678';
+      return;
+    }
+    errorEl.textContent = '';
+
+    tg.sendData(JSON.stringify({
+      group_name: hoe + ' ' + team + ' ' + district,
+      rep_name: repName,
+      phone: phone,
+      companions: companions,
+    }));
+    tg.close();
+  };
+</script>
+</body>
+</html>
+"""
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/webapp":
-            body = _WEBAPP_HTML.encode("utf-8")
+            body = _FULL_FORM_WEBAPP_HTML.encode("utf-8")
+        elif path == "/webapp/companions":
+            body = _COMPANIONS_WEBAPP_HTML.encode("utf-8")
+        else:
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(b"OK")
             return
         self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(body)
 
     def log_message(self, format, *args):
         pass
@@ -1296,7 +1533,10 @@ def main():
                 CallbackQueryHandler(full_slot_clicked, pattern=r"^full$"),
                 CallbackQueryHandler(slot_selected, pattern=r"^slot_\d{2}:\d{2}$"),
             ],
-            ENTER_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, group_entered)],
+            ENTER_GROUP: [
+                MessageHandler(filters.StatusUpdate.WEB_APP_DATA, form_webapp_received),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, group_entered),
+            ],
             ENTER_LEADER: [MessageHandler(filters.TEXT & ~filters.COMMAND, leader_entered)],
             ENTER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, phone_entered)],
             ENTER_COMPANIONS: [
