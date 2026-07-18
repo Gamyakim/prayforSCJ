@@ -325,6 +325,27 @@ def mark_checked_in(signup_id: int, requester_user_id: int):
         conn.close()
 
 
+def admin_unmark_checked_in(signup_id: int):
+    """관리자가 참여완료 상태를 되돌림. 결과를 ('ok'|'not_checked'|'not_found') 형태로 반환."""
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signups WHERE id = %s", (signup_id,))
+        row = cur.fetchone()
+        if row is None:
+            return "not_found"
+        if not row["checked_in"]:
+            return "not_checked"
+        cur.execute(
+            "UPDATE signups SET checked_in = 0, checked_in_at = NULL WHERE id = %s",
+            (signup_id,),
+        )
+        conn.commit()
+        return "ok"
+    finally:
+        conn.close()
+
+
 def get_all_signups():
     conn = get_conn()
     try:
@@ -484,6 +505,19 @@ def sheet_update_checkin(signup_id):
         ws.update_cell(row, 8, "✅")
     except Exception:
         logger.exception("구글 시트 참여완료 업데이트 실패 (signup_id=%s)", signup_id)
+
+
+def sheet_unmark_checkin(signup_id):
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    row = _find_sheet_row_by_id(ws, signup_id)
+    if row is None:
+        return
+    try:
+        ws.update_cell(row, 8, "⏳")
+    except Exception:
+        logger.exception("구글 시트 참여완료 되돌리기 실패 (signup_id=%s)", signup_id)
 
 
 def sheet_delete_row(signup_id):
@@ -1207,6 +1241,26 @@ async def admin_delete_signup(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
+async def admin_unmark_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+
+    match = re.match(r"^참여취소\s+(\d+)$", update.message.text.strip())
+    if not match:
+        return None
+    context.user_data.clear()
+    signup_id = int(match.group(1))
+    result = admin_unmark_checked_in(signup_id)
+    if result == "ok":
+        await asyncio.to_thread(sheet_unmark_checkin, signup_id)
+        await update.message.reply_text(f"↩️ [{signup_id}]번 신청을 참여 전 상태로 되돌렸습니다.")
+    elif result == "not_checked":
+        await update.message.reply_text(f"[{signup_id}]번 신청은 아직 참여완료 상태가 아니에요.")
+    else:
+        await update.message.reply_text(f"[{signup_id}]번 신청을 찾을 수 없어요.")
+    return ConversationHandler.END
+
+
 async def admin_set_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return None
@@ -1688,6 +1742,7 @@ def main():
             MessageHandler(filters.Regex(r"^관리자$"), admin_command),
             MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list),
             MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup),
+            MessageHandler(filters.Regex(r"^참여취소\s+\d+$"), admin_unmark_checkin),
             MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title),
             MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin),
             MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), admin_remove_admin),
@@ -1716,6 +1771,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^관리자$"), _stop_after(admin_command)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), _stop_after(admin_full_list)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), _stop_after(admin_delete_signup)), group=-1)
+    app.add_handler(MessageHandler(filters.Regex(r"^참여취소\s+\d+$"), _stop_after(admin_unmark_checkin)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), _stop_after(admin_set_title)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), _stop_after(admin_add_admin)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), _stop_after(admin_remove_admin)), group=-1)
