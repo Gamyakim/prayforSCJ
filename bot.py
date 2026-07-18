@@ -690,7 +690,9 @@ async def form_webapp_received(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data["rep_name"] = rep_name
     context.user_data["phone"] = phone
 
-    return await _finalize_companions(update.effective_message, context, companions)
+    return await _finalize_companions(
+        update.effective_message, context, companions, retry_state=ENTER_GROUP
+    )
 
 
 async def leader_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -737,8 +739,11 @@ async def phone_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ENTER_COMPANIONS
 
 
-async def _finalize_companions(message, context, companions: str):
-    """콤마 입력이든 미니앱 제출이든 공통으로 인원 검증 후 확인 화면을 보여준다."""
+async def _finalize_companions(message, context, companions: str, retry_state=ENTER_COMPANIONS):
+    """콤마 입력이든 미니앱 제출이든 공통으로 인원 검증 후 확인 화면을 보여준다.
+    retry_state: 인원 초과 등으로 거부됐을 때 되돌아갈 상태.
+    통합 폼(ENTER_GROUP) 경로에서 왔으면 통합 폼으로, 동반자 전용 경로에서 왔으면
+    동반자 입력으로 정확히 돌려보내야 다음 제출이 엉뚱한 처리기로 새지 않는다."""
     headcount = signup_headcount(companions)
 
     if headcount > MAX_PER_SLOT:
@@ -747,7 +752,7 @@ async def _finalize_companions(message, context, companions: str):
             f"입력하신 인원은 총 {headcount}명이라 넘어가요.\n"
             "동반자 수를 줄여서 다시 입력해주세요."
         )
-        return ENTER_COMPANIONS
+        return await _reprompt_for_retry(message, context, retry_state)
 
     slot = context.user_data["slot_time"]
     current = get_slot_headcount(slot)
@@ -757,7 +762,7 @@ async def _finalize_companions(message, context, companions: str):
             f"'{slot}' 타임에 남은 자리가 {remaining}명뿐이에요 (입력하신 인원 총 {headcount}명).\n"
             "동반자 수를 줄이거나, '취소' 입력 후 다른 타임을 선택해주세요."
         )
-        return ENTER_COMPANIONS
+        return await _reprompt_for_retry(message, context, retry_state)
 
     context.user_data["companions"] = companions
 
@@ -784,6 +789,49 @@ async def _finalize_companions(message, context, companions: str):
     )
     await message.reply_text(summary, reply_markup=keyboard)
     return CONFIRM
+
+
+async def _reprompt_for_retry(message, context, retry_state):
+    """인원 초과 등으로 거부된 후, 다음 입력이 올바른 처리기로 가도록 상태에 맞는
+    버튼/안내를 다시 보여준다."""
+    if retry_state == ENTER_GROUP:
+        # 통합 폼 경로에서 거부된 경우: 이전에 입력했던 값은 버리고 폼을 통째로 다시 받는다
+        # (부분적으로 남은 값이 엉뚱하게 재사용되는 것을 방지)
+        context.user_data.pop("group_name", None)
+        context.user_data.pop("rep_name", None)
+        context.user_data.pop("phone", None)
+        context.user_data.pop("companions", None)
+        if WEBAPP_BASE_URL:
+            keyboard = ReplyKeyboardMarkup(
+                [[KeyboardButton(
+                    "📝 신청 정보 입력하기",
+                    web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp"),
+                )]],
+                resize_keyboard=True,
+            )
+            await message.reply_text(
+                "아래 버튼을 다시 눌러서 처음부터 다시 입력해주세요.",
+                reply_markup=keyboard,
+            )
+        else:
+            await message.reply_text("회/지역/팀/구역명부터 다시 입력해주세요.")
+        return ENTER_GROUP
+
+    # 동반자 입력(ENTER_COMPANIONS) 경로에서 거부된 경우: 동반자만 다시 받으면 됨
+    if WEBAPP_BASE_URL:
+        keyboard = ReplyKeyboardMarkup(
+            [[KeyboardButton(
+                "📝 동반자 입력하기",
+                web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/webapp/companions"),
+            )]],
+            resize_keyboard=True,
+        )
+        await message.reply_text(
+            "동반자를 다시 입력해주세요.", reply_markup=keyboard
+        )
+    else:
+        await message.reply_text("동반자를 다시 입력해주세요 (없으면 '없음').")
+    return ENTER_COMPANIONS
 
 
 async def companions_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
