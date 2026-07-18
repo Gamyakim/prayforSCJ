@@ -236,7 +236,10 @@ def companion_count(companions: str) -> int:
     s = (companions or "").strip()
     if not s or s == "없음":
         return 0
-    return len([c for c in s.split(",") if c.strip()])
+    # 콤마(,)로 구분하는 게 기본이지만, 사용자가 띄어쓰기로만 구분해서 입력한 경우도
+    # 대비해서 콤마/공백 어느 쪽이든 구분자로 인식해 정확히 센다.
+    parts = re.split(r"[,\s]+", s)
+    return len([c for c in parts if c.strip()])
 
 
 def signup_headcount(companions: str) -> int:
@@ -395,6 +398,47 @@ def delete_signup(signup_id: int) -> bool:
         conn.close()
 
 
+def get_signup_by_id(signup_id: int):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM signups WHERE id = %s", (signup_id,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_slot_headcount_excluding(slot_time: str, exclude_id: int) -> int:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT companions FROM signups WHERE slot_time = %s AND id != %s",
+            (slot_time, exclude_id),
+        )
+        rows = cur.fetchall()
+        return sum(signup_headcount(r["companions"]) for r in rows)
+    finally:
+        conn.close()
+
+
+def update_signup_field(signup_id: int, column: str, value: str) -> bool:
+    """column은 아래 함수 내부 화이트리스트에서만 골라 쓰므로 SQL 인젝션 위험 없음."""
+    if column not in ("group_name", "rep_name", "phone", "companions"):
+        raise ValueError(f"허용되지 않은 컬럼: {column}")
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE signups SET {column} = %s WHERE id = %s", (value, signup_id)
+        )
+        updated = cur.rowcount > 0
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
 def delete_signup_by_owner(signup_id: int, requester_user_id: int) -> str:
     conn = get_conn()
     try:
@@ -518,6 +562,33 @@ def sheet_unmark_checkin(signup_id):
         ws.update_cell(row, 8, "⏳")
     except Exception:
         logger.exception("구글 시트 참여완료 되돌리기 실패 (signup_id=%s)", signup_id)
+
+
+# 시트 컬럼: A=ID, B=시간, C=회/지역/팀/구역, D=인솔자, E=연락처, F=동반자, G=인원수, H=참여여부, I=신청일시
+_SHEET_FIELD_COLUMN = {
+    "group_name": 3,
+    "rep_name": 4,
+    "phone": 5,
+    "companions": 6,
+}
+
+
+def sheet_update_field(signup_id, field: str, value: str, headcount: int = None):
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    row = _find_sheet_row_by_id(ws, signup_id)
+    if row is None:
+        return
+    col = _SHEET_FIELD_COLUMN.get(field)
+    if col is None:
+        return
+    try:
+        ws.update_cell(row, col, value)
+        if headcount is not None:
+            ws.update_cell(row, 7, headcount)
+    except Exception:
+        logger.exception("구글 시트 필드 수정 실패 (signup_id=%s, field=%s)", signup_id, field)
 
 
 def sheet_delete_row(signup_id):
@@ -1261,6 +1332,75 @@ async def admin_unmark_checkin(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+_EDIT_FIELD_MAP = {
+    "회": "group_name",
+    "인솔자": "rep_name",
+    "연락처": "phone",
+    "동반자": "companions",
+}
+
+
+async def admin_edit_signup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return None
+
+    match = re.match(
+        r"^수정\s+(\d+)\s+(회|인솔자|연락처|동반자)\s+(.+)$",
+        update.message.text.strip(),
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    context.user_data.clear()
+
+    signup_id = int(match.group(1))
+    field_label = match.group(2)
+    new_value = match.group(3).strip()
+    column = _EDIT_FIELD_MAP[field_label]
+
+    row = get_signup_by_id(signup_id)
+    if row is None:
+        await update.message.reply_text(f"[{signup_id}]번 신청을 찾을 수 없어요.")
+        return ConversationHandler.END
+
+    headcount_for_sheet = None
+
+    if column == "phone":
+        if not PHONE_PATTERN.match(new_value):
+            await update.message.reply_text(
+                "연락처 형식이 올바르지 않아요. 예: 010-1234-5678"
+            )
+            return ConversationHandler.END
+
+    if column == "companions":
+        new_headcount = signup_headcount(new_value)
+        if new_headcount > MAX_PER_SLOT:
+            await update.message.reply_text(
+                f"한 건당 최대 인원은 {MAX_PER_SLOT}명이에요 (인솔자 포함). "
+                f"입력하신 인원은 총 {new_headcount}명이라 넘어가요."
+            )
+            return ConversationHandler.END
+        others = get_slot_headcount_excluding(row["slot_time"], signup_id)
+        if others + new_headcount > MAX_PER_SLOT:
+            remaining = max(MAX_PER_SLOT - others, 0)
+            await update.message.reply_text(
+                f"'{row['slot_time']}' 타임에 이 신청을 제외한 인원이 이미 {others}명이라, "
+                f"수정 후 인원은 최대 {remaining}명까지만 가능해요."
+            )
+            return ConversationHandler.END
+        headcount_for_sheet = new_headcount
+
+    update_signup_field(signup_id, column, new_value)
+    await asyncio.to_thread(
+        sheet_update_field, signup_id, column, new_value, headcount_for_sheet
+    )
+
+    await update.message.reply_text(
+        f"✅ [{signup_id}]번 신청의 {field_label} 항목을 다음으로 수정했어요:\n{new_value}"
+    )
+    return ConversationHandler.END
+
+
 async def admin_set_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return None
@@ -1743,6 +1883,10 @@ def main():
             MessageHandler(filters.Regex(r"^전체명단$"), admin_full_list),
             MessageHandler(filters.Regex(r"^삭제\s+\d+$"), admin_delete_signup),
             MessageHandler(filters.Regex(r"^참여취소\s+\d+$"), admin_unmark_checkin),
+            MessageHandler(
+                filters.Regex(r"^수정\s+\d+\s+(회|인솔자|연락처|동반자)\s+.+$"),
+                admin_edit_signup,
+            ),
             MessageHandler(filters.Regex(r"^제목설정\s+.+$"), admin_set_title),
             MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), admin_add_admin),
             MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), admin_remove_admin),
@@ -1772,6 +1916,13 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^전체명단$"), _stop_after(admin_full_list)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^삭제\s+\d+$"), _stop_after(admin_delete_signup)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^참여취소\s+\d+$"), _stop_after(admin_unmark_checkin)), group=-1)
+    app.add_handler(
+        MessageHandler(
+            filters.Regex(r"^수정\s+\d+\s+(회|인솔자|연락처|동반자)\s+.+$"),
+            _stop_after(admin_edit_signup),
+        ),
+        group=-1,
+    )
     app.add_handler(MessageHandler(filters.Regex(r"^제목설정\s+.+$"), _stop_after(admin_set_title)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^관리자추가\s+\S+$"), _stop_after(admin_add_admin)), group=-1)
     app.add_handler(MessageHandler(filters.Regex(r"^관리자삭제\s+\S+$"), _stop_after(admin_remove_admin)), group=-1)
