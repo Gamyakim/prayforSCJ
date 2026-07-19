@@ -1098,9 +1098,15 @@ async def my_signups_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"👥 동반자: {r['companions']} (총 {headcount}명)\n"
             f"상태: {status}"
         )
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("❌ 이 신청 취소", callback_data=f"usercancel_{r['id']}")]]
+        buttons = []
+        if not r["checked_in"]:
+            buttons.append(
+                InlineKeyboardButton("🙋 참여완료", callback_data=f"checkin_{r['id']}")
+            )
+        buttons.append(
+            InlineKeyboardButton("❌ 이 신청 취소", callback_data=f"usercancel_{r['id']}")
         )
+        keyboard = InlineKeyboardMarkup([buttons])
         await update.message.reply_text(text, reply_markup=keyboard)
     return ConversationHandler.END
 
