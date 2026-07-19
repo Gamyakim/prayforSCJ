@@ -1141,9 +1141,16 @@ def _build_full_list_text() -> str:
         by_slot.setdefault(r["slot_time"], []).append(r)
 
     total_signups = len(rows)
-    total_checked = sum(1 for r in rows if r["checked_in"])
+    total_people = sum(signup_headcount(r["companions"]) for r in rows)
+    checked_rows = [r for r in rows if r["checked_in"]]
+    total_checked = len(checked_rows)
+    total_checked_people = sum(signup_headcount(r["companions"]) for r in checked_rows)
 
-    lines = [f"📋 전체 신청 명단\n총 {total_signups}건 신청 / 참여완료 {total_checked}건\n"]
+    lines = [
+        f"📋 전체 신청 명단\n"
+        f"총 {total_signups}건({total_people}명) 신청 / "
+        f"참여완료 {total_checked}건({total_checked_people}명)\n"
+    ]
     for h in HOURS:
         for m in HOUR_MINUTES.get(h, []):
             slot = f"{h:02d}:{m:02d}"
@@ -1151,9 +1158,12 @@ def _build_full_list_text() -> str:
             if not entries:
                 continue
             filled = sum(signup_headcount(e["companions"]) for e in entries)
-            checked_cnt = sum(1 for e in entries if e["checked_in"])
+            checked_entries = [e for e in entries if e["checked_in"]]
+            checked_cnt = len(checked_entries)
+            checked_people = sum(signup_headcount(e["companions"]) for e in checked_entries)
             lines.append(
-                f"\n▶ {slot} — {filled}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}건)"
+                f"\n▶ {slot} — {len(entries)}건({filled}/{MAX_PER_SLOT}명) "
+                f"(참여완료 {checked_cnt}건({checked_people}명))"
             )
             for e in entries:
                 status = "✅" if e["checked_in"] else "⏳"
@@ -1263,9 +1273,12 @@ async def admin_hour_selected(update: Update, context: ContextTypes.DEFAULT_TYPE
             slot = f"{hour:02d}:{m:02d}"
             entries = by_slot.get(slot, [])
             filled = sum(signup_headcount(e["companions"]) for e in entries)
-            checked_cnt = sum(1 for e in entries if e["checked_in"])
+            checked_entries = [e for e in entries if e["checked_in"]]
+            checked_cnt = len(checked_entries)
+            checked_people = sum(signup_headcount(e["companions"]) for e in checked_entries)
             lines.append(
-                f"\n▶ {slot} — {filled}/{MAX_PER_SLOT}명 (참여완료 {checked_cnt}건)"
+                f"\n▶ {slot} — {len(entries)}건({filled}/{MAX_PER_SLOT}명) "
+                f"(참여완료 {checked_cnt}건({checked_people}명))"
             )
             for e in entries:
                 status = "✅" if e["checked_in"] else "⏳"
